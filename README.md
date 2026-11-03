@@ -27,7 +27,7 @@ Apple's license still applies to the guest. The installer is downloaded from App
           macos-kvm.enable = true;
           macos-kvm.user = "alex";
           macos-kvm.primeOffload = true; # hybrid NVIDIA
-          macos-kvm.hidpi = true;        # 1920x1080 mode, 3840x2160 framebuffer
+          macos-kvm.hidpi = true;        # 3840x2160 framebuffer, looks like 1920x1080
           macos-kvm.borderless = false;  # resizable window
         }
       ];

@@ -101,8 +101,10 @@ let
         reims-ctl "''${args[@]}"
       fi
 
-      state="$(reims-ctl show "$name" | awk '/^[[:space:]]*state[[:space:]]/ { print $2; exit }')"
-      if [[ "$state" == running ]]; then
+      state_line="$(reims-ctl show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]')"
+      # "state    running (pid N)" or "state    stopped"
+      set -- $state_line
+      if [[ "''${2:-}" == running ]]; then
         exit 0
       fi
       exec reims-ctl start "$name"
@@ -168,10 +170,10 @@ in
 
     resolution = lib.mkOption {
       type = lib.types.str;
-      default = "1920x1080";
+      default = "3840x2160";
       description = ''
-        Guest mode. With hidpi, 1920x1080 is a Retina framebuffer of
-        3840x2160 that looks like 1920x1080.
+        Guest framebuffer. With hidpi, reims-ctl halves each edge, so
+        3840x2160 looks like 1920x1080.
       '';
     };
 
