@@ -446,7 +446,16 @@ echo STARTOSINSTALL
 sync
 "$app/Contents/Resources/startosinstall" --agreetolicense --nointeraction \
   --installpackage /Volumes/MACOSKVM/bootstrap.pkg --volume "$target"
-echo "FAIL startosinstall exited $?"
+status=$?
+# Exit 0 means it staged the install and asked the system to reboot. The
+# process returns before the reboot, so a following echo must not look like
+# a failed install.
+if [ "$status" -eq 0 ]; then
+  echo REBOOTING
+  sync
+  while true; do sleep 60; done
+fi
+echo "FAIL startosinstall exited $status"
 exit 1
 """
 
@@ -621,6 +630,7 @@ def wait_reboot(name: str, image: Path, reims: str, timeout: float) -> None:
     deadline = time.time() + timeout
     qmp: Qmp | None = None
     last = ""
+    announced_reboot = False
     while time.time() < deadline:
         text = status_text(image)
         if text != last:
@@ -629,8 +639,11 @@ def wait_reboot(name: str, image: Path, reims: str, timeout: float) -> None:
                 for line in fresh.strip().splitlines():
                     log("guest: " + line)
             last = text
-        if "FAIL " in text:
+        if "FAIL " in text and "FAIL startosinstall exited 0" not in text:
             raise RuntimeError(text.strip())
+        if not announced_reboot and ("REBOOTING" in text or "Restarting" in text):
+            log("startosinstall asked the guest to reboot")
+            announced_reboot = True
         if qmp is None:
             try:
                 qmp = Qmp(qmp_path(name))
