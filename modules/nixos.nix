@@ -149,12 +149,11 @@ let
       fi
       macos-kvm-install "''${install_args[@]}"
 
-      state_line="$(reims-ctl show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]')"
+      state_line="$(reims-ctl show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]' || true)"
       # "state    running (pid N)" or "state    stopped"
-      set -- $state_line
-      if [[ "''${2:-}" == running ]]; then
-        exit 0
-      fi
+      case "$state_line" in
+        *" running "*|*" running") exit 0 ;;
+      esac
       exec reims-ctl start "$name"
     '';
   };
