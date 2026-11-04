@@ -449,8 +449,9 @@ in
       after = [ "graphical-session.target" ];
       partOf = [ "graphical-session.target" ];
       serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
+        # simple, not oneshot: activation starts the install and returns.
+        # The install itself runs for as long as Apple's installer takes.
+        Type = "simple";
         TimeoutStartSec = "infinity";
         ExecStart = "${session}/bin/macos-kvm ensure";
         ExecStop = "${session}/bin/macos-kvm stop ${cfg.name} --timeout ${toString cfg.stopTimeout}";
