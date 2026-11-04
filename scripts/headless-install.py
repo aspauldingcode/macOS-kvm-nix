@@ -510,8 +510,7 @@ def attach_bootstrap(reims: str, name: str, image: Path | None) -> None:
         run([reims, "set", name, "--extra-args", ""])
         return
     extra = (
-        f"-drive id=bootstrap,if=none,format=raw,file={image},"
-        "cache=writethrough,locking=off "
+        f"-drive id=bootstrap,if=none,format=raw,file={image},cache=writethrough "
         "-device ide-hd,bus=sata.5,drive=bootstrap"
     )
     run([reims, "set", name, "--extra-args", extra])
