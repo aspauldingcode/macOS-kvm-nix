@@ -16,6 +16,7 @@
   config,
   lib,
   pkgs,
+  options,
   ...
 }:
 let
@@ -154,20 +155,20 @@ let
           "  UserKnownHostsFile $sshdir/known_hosts" \
           > "$sshdir/config"
         chmod 600 "$sshdir/config"
-        local include="Include $sshdir/config"
-        touch "$HOME/.ssh/config" "$HOME/.ssh/authorized_keys"
-        chmod 600 "$HOME/.ssh/config" "$HOME/.ssh/authorized_keys"
-        if ! grep -qxF "$include" "$HOME/.ssh/config"; then
-          local tmp
-          tmp="$(mktemp)"
-          printf '%s\n\n' "$include" | cat - "$HOME/.ssh/config" > "$tmp"
-          mv "$tmp" "$HOME/.ssh/config"
-          chmod 600 "$HOME/.ssh/config"
-        fi
-        local pub
-        pub="$(cat "$sshdir/guest_id_ed25519.pub")"
-        if ! grep -qxF "$pub" "$HOME/.ssh/authorized_keys"; then
-          printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
+        # ~/.ssh/config is often a Home Manager symlink into the store.
+        # The include is added there when Home Manager is present. This file
+        # is what `macos-kvm ssh` uses either way.
+        local keys="$HOME/.ssh/authorized_keys"
+        if [[ -L "$keys" ]]; then
+          :
+        else
+          touch "$keys"
+          chmod 600 "$keys"
+          local pub
+          pub="$(cat "$sshdir/guest_id_ed25519.pub")"
+          if ! grep -qxF "$pub" "$keys"; then
+            printf '%s\n' "$pub" >> "$keys"
+          fi
         fi
       }
 
@@ -396,7 +397,8 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkMerge [
+    (lib.mkIf cfg.enable {
     assertions = [
       {
         assertion = pkgs.stdenv.hostPlatform.isx86_64 && pkgs.stdenv.hostPlatform.isLinux;
@@ -456,6 +458,11 @@ in
         ExecStart = "${session}/bin/macos-kvm ensure";
         ExecStop = "${session}/bin/macos-kvm stop ${cfg.name} --timeout ${toString cfg.stopTimeout}";
       };
-    };
-  };
+    })
+    (lib.mkIf (cfg.enable && options ? home-manager) {
+      home-manager.users.${cfg.user}.programs.ssh.includes = [
+        "${config.users.users.${cfg.user}.home}/.local/share/reims-ctl/vms/*/ssh/config"
+      ];
+    })
+  ];
 }
