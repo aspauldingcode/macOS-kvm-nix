@@ -28,10 +28,14 @@ let
   nvidiaIcd = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
 
   # reims-ctl's wrapper pins REIMS_CTL_QEMU. The unwrapped binary honours the
-  # variable, so the share directory can be added to the netdev at start.
-  qemuShare = pkgs.writeShellScript "macos-kvm-qemu" ''
+  # variable, and it looks for qemu-img in the same directory as that binary.
+  # The share directory is added to the user netdev at start.
+  qemuShare = pkgs.runCommand "macos-kvm-qemu" { } ''
+    mkdir -p $out/bin
+    cat > $out/bin/qemu-system-x86_64 <<'EOF'
+    #!${pkgs.bash}/bin/bash
     set -euo pipefail
-    real=${reims}/bin/qemu-system-x86_64
+    real=@qemu@
     share="''${MACOS_KVM_SHARE:-}"
     if [[ -z "$share" ]]; then
       exec "$real" "$@"
@@ -47,6 +51,11 @@ let
       shift
     done
     exec "$real" "''${args[@]}"
+EOF
+    sed -i 's/^    //' $out/bin/qemu-system-x86_64
+    substituteInPlace $out/bin/qemu-system-x86_64 --replace-fail @qemu@ ${reims}/bin/qemu-system-x86_64
+    chmod +x $out/bin/qemu-system-x86_64
+    ln -s ${reims}/bin/qemu-img $out/bin/qemu-img
   '';
 
   # mkbom writes the file name into a one-byte char array that is allocated
@@ -98,7 +107,7 @@ let
       set -euo pipefail
 
       export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-      export REIMS_CTL_QEMU=${qemuShare}
+      export REIMS_CTL_QEMU=${qemuShare}/bin/qemu-system-x86_64
       export REIMS_CTL_UTIL=${reims}/bin/reims-util
       export MACOS_KVM_SHARE="$HOME/SHARED_FOLDER"
       reims_ctl=${reims}/bin/.reims-ctl-wrapped
