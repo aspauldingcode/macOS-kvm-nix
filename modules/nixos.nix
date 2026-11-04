@@ -147,6 +147,10 @@ EOF
           ssh-keygen -t ed25519 -N "" -C "macos-kvm-$name-guest" -f "$sshdir/guest_id_ed25519"
         fi
         chmod 600 "$sshdir/id_ed25519" "$sshdir/guest_id_ed25519"
+        # %C is 40 hex characters. The VM directory makes that path longer
+        # than a Unix socket name, so the multiplex socket lives in the runtime dir.
+        local runtime="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        mkdir -p "$runtime"
         printf '%s\n' \
           "Host $name macos macos-kvm" \
           "  HostName 127.0.0.1" \
@@ -155,7 +159,7 @@ EOF
           "  IdentityFile $sshdir/id_ed25519" \
           "  IdentitiesOnly yes" \
           "  ControlMaster auto" \
-          "  ControlPath $sshdir/cm-%C" \
+          "  ControlPath $runtime/macos-kvm-%C" \
           "  ControlPersist 10m" \
           "  Compression no" \
           "  Ciphers aes128-gcm@openssh.com" \
@@ -260,9 +264,14 @@ EOF
       state_line="$("$reims_ctl" show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]' || true)"
       # "state    running (pid N)" or "state    stopped"
       case "$state_line" in
-        *" running "*|*" running") exit 0 ;;
+        *" running "*|*" running") ;;
+        *) "$reims_ctl" start "$name" ;;
       esac
-      exec "$reims_ctl" start "$name"
+      # Type=simple runs ExecStop when this process exits, and ExecStop
+      # powers the guest off. Stay alive for as long as the guest does.
+      while "$reims_ctl" show "$name" 2>/dev/null | grep -q 'running'; do
+        sleep 5
+      done
     '';
   };
 in
