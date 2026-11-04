@@ -38,12 +38,18 @@ Apple's license still applies to the guest. The installer is downloaded from App
 
 `nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and installs macOS. Nothing in Recovery is clicked. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
 
-The install is headless. It downloads Apple's full installer (about 17 GiB) and types Command-Shift-T into Recovery once, over the QMP socket. The script on the small disk erases the guest disk, expands `InstallAssistant.pkg` the way mist does (`CM_BUILD=CM_BUILD installer -pkg`), and runs `startosinstall --agreetolicense --nointeraction --forcequitapps --volume`. Nothing is typed after that. When startosinstall reboots, Apple's image is ejected so OpenCore boots the internal disk instead of returning to the Recovery window. When SSH answers, the window opens.
+The install is headless. It downloads Apple's full installer (about 17 GiB) and types Command-Shift-T into Recovery once, over the QMP socket. The script on the small disk erases the guest disk, expands `InstallAssistant.pkg` the way mist does (`CM_BUILD=CM_BUILD installer -pkg`), and runs `startosinstall --agreetolicense --nointeraction --forcequitapps --volume` with one package. That package is what the first boot uses to create the account, turn on auto-login and SSH, skip Setup Assistant, set Metal's error mode, and mount the shared folder. Nothing is typed after the script starts. When startosinstall reboots, Apple's image is ejected so OpenCore boots the internal disk instead of returning to the Recovery window. When SSH answers, the window opens on the logged-in desktop.
+
+OpenCore's serial, board serial, UUID, and ROM come from `macserial`, the same program [osx-serial-generator](https://github.com/sickcodes/osx-serial-generator) runs, for an iMac20,1. They are written into reims-util's OpenCore image, which keeps `ReimsVgpu.kext`. The generator's own boot disk is not used.
+
+`~/SHARED_FOLDER` on the host is the guest's `~/SHARED_FOLDER`. QEMU exports it over the guest's virtual network (`smb://10.0.2.4/qemu`), and a login agent mounts it. `ssh tahoe` (and `macos-kvm ssh`) reaches the guest on `127.0.0.1:2222` with a key, and the guest reaches the host as `ssh host` at `10.0.2.2`.
 
 ```sh
 macos-kvm            # install if needed, then open the window
+macos-kvm ssh        # shell on the guest
 macos-kvm account    # print the generated password
 macos-kvm show tahoe
+ssh tahoe            # same guest, from the host ssh config
 ```
 
 The password file is `~/.local/share/reims-ctl/vms/tahoe/account.password` (mode 0600). Set `macos-kvm.accountPasswordFile` to a runtime path to choose one. A password written in the NixOS configuration would land in the world-readable store.

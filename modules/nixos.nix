@@ -7,9 +7,10 @@
 #
 # `nh os switch` installs the toolchain. At the next graphical session the
 # user service creates the VM if it is missing and installs macOS with no
-# clicks: Command-Shift-T over QMP, a script on a small disk, and a package
-# the installer applies itself. The disk lives under the user's XDG data
-# directory, not in the Nix store: Apple's image is machine state.
+# clicks. OpenCore gets a macserial identity (the generator
+# osx-serial-generator runs). A package applied by startosinstall creates
+# the account, turns on auto-login and SSH, and mounts ~/SHARED_FOLDER.
+# The disk lives under the user's XDG data directory, not in the Nix store.
 { self }:
 {
   config,
@@ -21,8 +22,31 @@ let
   cfg = config.macos-kvm;
   reims = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
   account = if cfg.accountName == null then cfg.user else cfg.accountName;
+  macserial = pkgs.callPackage ../pkgs/macserial.nix { };
 
   nvidiaIcd = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
+
+  # reims-ctl's wrapper pins REIMS_CTL_QEMU. The unwrapped binary honours the
+  # variable, so the share directory can be added to the netdev at start.
+  qemuShare = pkgs.writeShellScript "macos-kvm-qemu" ''
+    set -euo pipefail
+    real=${reims}/bin/qemu-system-x86_64
+    share="''${MACOS_KVM_SHARE:-}"
+    if [[ -z "$share" ]]; then
+      exec "$real" "$@"
+    fi
+    args=()
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == -netdev && "''${2:-}" == user,* && "''${2:-}" != *",smb="* ]]; then
+        args+=(-netdev "$2,smb=$share")
+        shift 2
+        continue
+      fi
+      args+=("$1")
+      shift
+    done
+    exec "$real" "''${args[@]}"
+  '';
 
   # mkbom writes the file name into a one-byte char array that is allocated
   # to the real length. glibc's fortify check aborts that copy.
@@ -44,6 +68,8 @@ let
         pkgs.gzip
         pkgs.procps
         pkgs.coreutils
+        pkgs.openssh
+        macserial
       ]
     }:$PATH"
     exec ${pkgs.python3}/bin/python3 ${../scripts/headless-install.py} "$@"
@@ -65,11 +91,16 @@ let
       installer
       pkgs.coreutils
       pkgs.gnugrep
+      pkgs.openssh
     ];
     text = ''
       set -euo pipefail
 
       export XDG_RUNTIME_DIR="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+      export REIMS_CTL_QEMU=${qemuShare}
+      export REIMS_CTL_UTIL=${reims}/bin/reims-util
+      export MACOS_KVM_SHARE="$HOME/SHARED_FOLDER"
+      reims_ctl=${reims}/bin/.reims-ctl-wrapped
       # NixOS publishes Vulkan ICDs here. A user service does not always
       # inherit the desktop's XDG_DATA_DIRS, and reims-ctl only searches those.
       case ":''${XDG_DATA_DIRS:-}:" in
@@ -89,19 +120,73 @@ let
 
       name=${lib.escapeShellArg cfg.name}
       account=${lib.escapeShellArg account}
+      host_user=${lib.escapeShellArg cfg.user}
+      ssh_port=${toString (if cfg.sshPort == null then 2222 else cfg.sshPort)}
       password_file=${lib.escapeShellArg (if cfg.accountPasswordFile == null then "" else cfg.accountPasswordFile)}
+
+      publish_access() {
+        local dir="$HOME/.local/share/reims-ctl/vms/$name"
+        local sshdir="$dir/ssh"
+        mkdir -p "$sshdir" "$HOME/SHARED_FOLDER" "$HOME/.ssh"
+        chmod 700 "$sshdir" "$HOME/.ssh"
+        chmod 755 "$HOME/SHARED_FOLDER"
+        if [[ ! -f "$sshdir/id_ed25519" ]]; then
+          ssh-keygen -t ed25519 -N "" -C "macos-kvm-$name" -f "$sshdir/id_ed25519"
+        fi
+        if [[ ! -f "$sshdir/guest_id_ed25519" ]]; then
+          ssh-keygen -t ed25519 -N "" -C "macos-kvm-$name-guest" -f "$sshdir/guest_id_ed25519"
+        fi
+        chmod 600 "$sshdir/id_ed25519" "$sshdir/guest_id_ed25519"
+        printf '%s\n' \
+          "Host $name macos macos-kvm" \
+          "  HostName 127.0.0.1" \
+          "  Port $ssh_port" \
+          "  User $account" \
+          "  IdentityFile $sshdir/id_ed25519" \
+          "  IdentitiesOnly yes" \
+          "  ControlMaster auto" \
+          "  ControlPath $sshdir/cm-%C" \
+          "  ControlPersist 10m" \
+          "  Compression no" \
+          "  Ciphers aes128-gcm@openssh.com" \
+          "  IPQoS none" \
+          "  StrictHostKeyChecking accept-new" \
+          "  UserKnownHostsFile $sshdir/known_hosts" \
+          > "$sshdir/config"
+        chmod 600 "$sshdir/config"
+        local include="Include $sshdir/config"
+        touch "$HOME/.ssh/config" "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/config" "$HOME/.ssh/authorized_keys"
+        if ! grep -qxF "$include" "$HOME/.ssh/config"; then
+          local tmp
+          tmp="$(mktemp)"
+          printf '%s\n\n' "$include" | cat - "$HOME/.ssh/config" > "$tmp"
+          mv "$tmp" "$HOME/.ssh/config"
+          chmod 600 "$HOME/.ssh/config"
+        fi
+        local pub
+        pub="$(cat "$sshdir/guest_id_ed25519.pub")"
+        if ! grep -qxF "$pub" "$HOME/.ssh/authorized_keys"; then
+          printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
+        fi
+      }
 
       cmd="''${1:-open}"
       case "$cmd" in
-        open|ensure) ;;
+        open|ensure) publish_access ;;
         account)
           cat "$HOME/.local/share/reims-ctl/vms/$name/account.password"
           exit 0
           ;;
-        *) exec reims-ctl "$@" ;;
+        ssh)
+          publish_access
+          shift
+          exec ssh -F "$HOME/.local/share/reims-ctl/vms/$name/ssh/config" "$name" "$@"
+          ;;
+        *) exec "$reims_ctl" "$@" ;;
       esac
 
-      if ! reims-ctl show "$name" >/dev/null 2>&1; then
+      if ! "$reims_ctl" show "$name" >/dev/null 2>&1; then
         args=(
           create "$name"
           --macos ${lib.escapeShellArg cfg.macos}
@@ -134,27 +219,31 @@ let
               args+=(--gpu auto)
             ''
         }
-        reims-ctl "''${args[@]}"
+        "$reims_ctl" "''${args[@]}"
       fi
 
       install_args=(
         run
         --name "$name"
         --account "$account"
+        --host-user "$host_user"
         --macos ${lib.escapeShellArg cfg.macos}
-        --ssh-port ${toString (if cfg.sshPort == null then 2222 else cfg.sshPort)}
+        --ssh-port "$ssh_port"
+        --reims "$reims_ctl"
+        --util ${reims}/bin/reims-util
+        --macserial ${macserial}/bin/macserial
       )
       if [[ -n "$password_file" ]]; then
         install_args+=(--password-file "$password_file")
       fi
       macos-kvm-install "''${install_args[@]}"
 
-      state_line="$(reims-ctl show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]' || true)"
+      state_line="$("$reims_ctl" show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]' || true)"
       # "state    running (pid N)" or "state    stopped"
       case "$state_line" in
         *" running "*|*" running") exit 0 ;;
       esac
-      exec reims-ctl start "$name"
+      exec "$reims_ctl" start "$name"
     '';
   };
 in
@@ -332,6 +421,22 @@ in
     '';
 
     users.users.${cfg.user}.extraGroups = [ "kvm" ];
+
+    # QEMU's slirp SMB server runs the smbd path it was built with, which is
+    # /usr/sbin/smbd, and that process has to bind port 445. The wrapper is
+    # the only thing on the host that listens, and only on 127.0.0.1, which
+    # is where the guest's 10.0.2.4 is forwarded.
+    security.wrappers.smbd = {
+      owner = "root";
+      group = "root";
+      capabilities = "cap_net_bind_service+ep";
+      source = "${pkgs.samba}/bin/smbd";
+    };
+    systemd.tmpfiles.rules = [
+      "d /usr/sbin 0755 root root -"
+      "L+ /usr/sbin/smbd - - - - /run/wrappers/bin/smbd"
+      "d /home/${cfg.user}/SHARED_FOLDER 0755 ${cfg.user} users -"
+    ];
 
     environment.systemPackages = [
       reims

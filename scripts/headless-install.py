@@ -150,7 +150,145 @@ def shadow_hash(password: str) -> bytes:
     )
 
 
-def account_files(account: str, password: str, dest: Path) -> None:
+APPLE_OUIS = (
+    "00:03:93",
+    "00:0A:95",
+    "00:11:24",
+    "00:16:CB",
+    "00:1C:B3",
+    "00:1E:52",
+    "00:23:DF",
+    "00:25:4B",
+    "00:26:BB",
+    "28:CF:E9",
+    "3C:07:54",
+    "60:03:08",
+    "7C:6D:62",
+    "A4:B1:97",
+    "F0:18:98",
+)
+
+
+def generate_identity(directory: Path, macserial: str) -> dict[str, str]:
+    """One iMac20,1 identity, the way osx-serial-generator asks macserial for it.
+
+    The values are written into reims-util's OpenCore. That image keeps
+    ReimsVgpu.kext. The generator's own boot disk does not, so it is not used.
+    """
+    env_path = directory / "identity.env"
+    if env_path.exists():
+        values = {}
+        for line in env_path.read_text().splitlines():
+            if not line.startswith("export "):
+                continue
+            key, _, raw = line.removeprefix("export ").partition("=")
+            values[key] = raw.strip().strip('"')
+        needed = ("SERIAL", "BOARD_SERIAL", "UUID", "MAC_ADDRESS")
+        if all(values.get(k) for k in needed):
+            return {
+                "serial": values["SERIAL"],
+                "mlb": values["BOARD_SERIAL"],
+                "uuid": values["UUID"],
+                "mac": values["MAC_ADDRESS"],
+            }
+    line = capture([macserial, "--num", "1", "--model", "iMac20,1"]).strip()
+    serial, mlb = [part.strip() for part in line.split("|", 1)]
+    if len(serial) != 12 or len(mlb) != 17:
+        raise RuntimeError(f"macserial returned {line!r}")
+    system_uuid = str(uuid.uuid4()).upper()
+    prefix = APPLE_OUIS[int.from_bytes(os.urandom(1), "big") % len(APPLE_OUIS)]
+    tail = ":".join(f"{b:02X}" for b in os.urandom(3))
+    mac = f"{prefix}:{tail}"
+    env_path.write_text(
+        "\n".join(
+            [
+                "export DEVICE_MODEL=\"iMac20,1\"",
+                f"export SERIAL=\"{serial}\"",
+                f"export BOARD_SERIAL=\"{mlb}\"",
+                f"export UUID=\"{system_uuid}\"",
+                f"export MAC_ADDRESS=\"{mac}\"",
+                "",
+            ]
+        )
+    )
+    os.chmod(env_path, 0o600)
+    return {"serial": serial, "mlb": mlb, "uuid": system_uuid, "mac": mac}
+
+
+def apply_identity(reims: str, util: str, name: str, macserial: str) -> None:
+    directory = vm_dir(name)
+    if (directory / "identity.applied").exists():
+        return
+    ident = generate_identity(directory, macserial)
+    log(f"OpenCore identity {ident['serial']} ({ident['mac']})")
+    stop_vm(reims, name)
+    run([reims, "set", name, "--mac", ident["mac"]])
+    fresh = directory / "opencore.new.qcow2"
+    if fresh.exists():
+        fresh.unlink()
+    run(
+        [
+            util,
+            "opencore",
+            "-o",
+            str(fresh),
+            "--model",
+            "iMac20,1",
+            "--serial",
+            ident["serial"],
+            "--mlb",
+            ident["mlb"],
+            "--uuid",
+            ident["uuid"],
+            "--rom",
+            ident["mac"],
+            "--no-ovmf",
+        ]
+    )
+    dest = directory / "opencore.qcow2"
+    dest.unlink(missing_ok=True)
+    fresh.rename(dest)
+    (directory / "identity.applied").write_text("ok\n")
+
+
+def ensure_ssh_keys(directory: Path) -> Path:
+    ssh_dir = directory / "ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(ssh_dir, 0o700)
+    for name, comment in (
+        ("id_ed25519", "macos-kvm"),
+        ("guest_id_ed25519", "macos-kvm-guest"),
+    ):
+        private = ssh_dir / name
+        if not private.exists():
+            run(
+                [
+                    "ssh-keygen",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-C",
+                    comment,
+                    "-f",
+                    str(private),
+                ]
+            )
+        os.chmod(private, 0o600)
+    return ssh_dir
+
+
+def authorized_keys(ssh_dir: Path) -> str:
+    keys = [(ssh_dir / "id_ed25519.pub").read_text().strip()]
+    user_key = Path.home() / ".ssh" / "id_ed25519.pub"
+    if user_key.exists():
+        text = user_key.read_text().strip()
+        if text and text not in keys:
+            keys.append(text)
+    return "\n".join(keys) + "\n"
+
+
+def account_files(account: str, password: str, dest: Path, ssh_dir: Path, host_user: str) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     user = {
         "name": [account],
@@ -206,6 +344,21 @@ cp "$SRC/kcpassword" /etc/kcpassword
 chmod 600 /etc/kcpassword
 cp "$SRC/loginwindow.plist" /Library/Preferences/com.apple.loginwindow.plist
 touch /var/db/.AppleSetupDone
+mkdir -p /Users/{account}/.ssh /Users/{account}/SHARED_FOLDER
+cp "$SRC/authorized_keys" /Users/{account}/.ssh/authorized_keys
+cp "$SRC/guest_id_ed25519" /Users/{account}/.ssh/id_ed25519
+cp "$SRC/guest_id_ed25519.pub" /Users/{account}/.ssh/id_ed25519.pub
+cp "$SRC/guest_ssh_config" /Users/{account}/.ssh/config
+chmod 700 /Users/{account}/.ssh
+chmod 600 /Users/{account}/.ssh/authorized_keys /Users/{account}/.ssh/id_ed25519 /Users/{account}/.ssh/config
+chown -R 501:20 /Users/{account}
+cp "$SRC/nsmb.conf" /etc/nsmb.conf
+chmod 644 /etc/nsmb.conf
+cp "$SRC/share.sh" /Library/macos-kvm/share.sh
+chmod 755 /Library/macos-kvm/share.sh
+mkdir -p /Library/LaunchAgents
+cp "$SRC/com.macos-kvm.share.plist" /Library/LaunchAgents/com.macos-kvm.share.plist
+chmod 644 /Library/LaunchAgents/com.macos-kvm.share.plist
 systemsetup -setremotelogin on || true
 launchctl enable system/com.openssh.sshd || true
 launchctl bootstrap system /System/Library/LaunchDaemons/ssh.plist || true
@@ -216,6 +369,46 @@ fi
 touch /var/db/.macos-kvm-bootstrapped
 reboot
 """
+    )
+    (dest / "authorized_keys").write_text(authorized_keys(ssh_dir))
+    (dest / "guest_id_ed25519").write_bytes((ssh_dir / "guest_id_ed25519").read_bytes())
+    (dest / "guest_id_ed25519.pub").write_bytes((ssh_dir / "guest_id_ed25519.pub").read_bytes())
+    (dest / "guest_ssh_config").write_text(
+        f"""Host host linux
+  HostName 10.0.2.2
+  User {host_user}
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+  StrictHostKeyChecking accept-new
+  Compression no
+  Ciphers aes128-gcm@openssh.com
+"""
+    )
+    (dest / "nsmb.conf").write_text(
+        "[default]\nsigning_required=no\nvalidate_neg_off=yes\n"
+    )
+    (dest / "share.sh").write_text(
+        """#!/bin/bash
+dest="$HOME/SHARED_FOLDER"
+mkdir -p "$dest"
+if mount | grep -F -q " on $dest "; then
+  exit 0
+fi
+# QEMU's built-in SMB server. The share it exports is named qemu.
+exec mount_smbfs -N '//guest:@10.0.2.4/qemu' "$dest"
+"""
+    )
+    os.chmod(dest / "share.sh", 0o755)
+    (dest / "com.macos-kvm.share.plist").write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "com.macos-kvm.share",
+                "RunAtLoad": True,
+                "StartInterval": 20,
+                "ProgramArguments": ["/bin/bash", "/Library/macos-kvm/share.sh"],
+            },
+            fmt=plistlib.FMT_XML,
+        )
     )
     os.chmod(dest / "bootstrap.sh", 0o755)
     (dest / "com.macos-kvm.bootstrap.plist").write_bytes(
@@ -267,6 +460,13 @@ def build_pkg(stage: Path, pkg: Path) -> None:
         "GlobalPreferences.plist",
         "loginwindow.plist",
         "bootstrap.sh",
+        "authorized_keys",
+        "guest_id_ed25519",
+        "guest_id_ed25519.pub",
+        "guest_ssh_config",
+        "nsmb.conf",
+        "share.sh",
+        "com.macos-kvm.share.plist",
     ):
         shutil.copy(stage / name, lib / name)
     os.chmod(lib / "bootstrap.sh", 0o755)
@@ -447,8 +647,9 @@ echo STARTOSINSTALL
 sync
 # mist's install, plus the two flags that keep it from stopping on a dialog:
 # agree to the license, don't ask, quit apps that would block the reboot.
+# mist's flags, plus the product archive that creates the account on first boot.
 "$app/Contents/Resources/startosinstall" --agreetolicense --nointeraction \
-  --forcequitapps --volume "$target"
+  --forcequitapps --installpackage /Volumes/MACOSKVM/bootstrap.pkg --volume "$target"
 status=$?
 # Exit 0 means it staged the install and asked the system to reboot. The
 # process returns before the reboot, so a following echo must not look like
@@ -467,11 +668,12 @@ def image_spec(image: Path) -> str:
     return f"{image}@@{PART_OFFSET}"
 
 
-def build_image(vm_dir: Path, account: str, password: str) -> Path:
+def build_image(vm_dir: Path, account: str, password: str, host_user: str) -> Path:
     stage = vm_dir / "bootstrap-src"
     if stage.exists():
         shutil.rmtree(stage)
-    account_files(account, password, stage)
+    ssh_dir = ensure_ssh_keys(vm_dir)
+    account_files(account, password, stage, ssh_dir, host_user)
     component = stage / "component.pkg"
     pkg = stage / "bootstrap.pkg"
     build_pkg(stage, component)
@@ -496,6 +698,7 @@ def build_image(vm_dir: Path, account: str, password: str) -> Path:
     run(["mformat", "-i", spec, "-v", LABEL, "-F", "::"])
     for name in ("go.sh", "bootstrap.pkg", "status"):
         run(["mcopy", "-pm", "-i", spec, str(stage / name), f"::{name}"])
+    os.chmod(image, 0o600)
     return image
 
 
@@ -739,6 +942,8 @@ def continue_staged(args: argparse.Namespace) -> None:
 
 def install(args: argparse.Namespace) -> None:
     name = args.name
+    if not args.host_user:
+        args.host_user = args.account
     directory = vm_dir(name)
     stamp = directory / "headless-installed"
     staged = directory / "install-staged"
@@ -754,6 +959,8 @@ def install(args: argparse.Namespace) -> None:
     if staged.exists():
         continue_staged(args)
         return
+    apply_identity(args.reims, args.util, name, args.macserial)
+    ensure_ssh_keys(directory)
     password = password_for(name, args.password_file)
     log(f"macOS account is {args.account}")
     log(f"password file is {directory / 'account.password'}")
@@ -762,7 +969,7 @@ def install(args: argparse.Namespace) -> None:
         # is the long wait, and insert only works once the VM is stopped.
         ensure_offline(args.reims, args.util, name, args.macos)
         stop_vm(args.reims, name)
-        image = build_image(directory, args.account, password)
+        image = build_image(directory, args.account, password, args.host_user)
         attach_bootstrap(args.reims, name, image)
         set_env(args.reims, name, headless=True)
         start_vm(args.reims, name)
@@ -824,7 +1031,7 @@ def install(args: argparse.Namespace) -> None:
 
 def prepare(args: argparse.Namespace) -> None:
     dest = Path(args.dest)
-    image = build_image(dest, args.account, args.password)
+    image = build_image(dest, args.account, args.password, args.account)
     listing = capture(["mdir", "-i", image_spec(image), "::"])
     xar = capture(["xar", "-tf", str(dest / "bootstrap-src" / "bootstrap.pkg")])
     log(listing.strip())
@@ -843,6 +1050,8 @@ def main() -> None:
     run_p.add_argument("--password-file", default=None)
     run_p.add_argument("--reims", default="reims-ctl")
     run_p.add_argument("--util", default="reims-util")
+    run_p.add_argument("--macserial", default="macserial")
+    run_p.add_argument("--host-user", default="")
     run_p.set_defaults(func=install)
     prep = sub.add_parser("prepare")
     prep.add_argument("--dest", required=True)

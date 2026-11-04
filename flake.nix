@@ -23,10 +23,11 @@
         config.allowUnfree = true;
       };
       reims = pkgs.callPackage ./pkgs/reims-ctl.nix { };
+      macserial = pkgs.callPackage ./pkgs/macserial.nix { };
     in
     {
       packages.${system} = {
-        inherit reims;
+        inherit reims macserial;
         default = reims;
       };
 
