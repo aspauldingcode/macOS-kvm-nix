@@ -174,7 +174,7 @@ let
 
       cmd="''${1:-open}"
       case "$cmd" in
-        open|ensure) publish_access ;;
+        open|ensure) ;;
         account)
           cat "$HOME/.local/share/reims-ctl/vms/$name/account.password"
           exit 0
@@ -188,6 +188,12 @@ let
       esac
 
       if ! "$reims_ctl" show "$name" >/dev/null 2>&1; then
+        vm_dir="$HOME/.local/share/reims-ctl/vms/$name"
+        # SSH keys live in the VM directory. Creating that directory first makes
+        # reims-ctl refuse to create the VM.
+        if [[ -d "$vm_dir" && ! -f "$vm_dir/vm.toml" ]]; then
+          rm -rf "$vm_dir"
+        fi
         args=(
           create "$name"
           --macos ${lib.escapeShellArg cfg.macos}
@@ -222,6 +228,7 @@ let
         }
         "$reims_ctl" "''${args[@]}"
       fi
+      publish_access
 
       install_args=(
         run
