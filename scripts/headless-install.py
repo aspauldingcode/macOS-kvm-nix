@@ -923,7 +923,8 @@ def continue_staged(args: argparse.Namespace) -> None:
         set_env(args.reims, name, headless=True)
         start_vm(args.reims, name)
     log(f"waiting for SSH on 127.0.0.1:{args.ssh_port}")
-    deadline = time.time() + 3 * 60 * 60
+    # Tahoe's staged install keeps writing for several hours on a laptop disk.
+    deadline = time.time() + 8 * 60 * 60
     while time.time() < deadline:
         if ssh_up(args.ssh_port):
             time.sleep(45)
@@ -1002,7 +1003,9 @@ def install(args: argparse.Namespace) -> None:
         # can still report in.
         start_vm(args.reims, name)
         log(f"waiting for SSH on 127.0.0.1:{args.ssh_port}")
-        deadline = time.time() + 3 * 60 * 60
+        # The first boot after startosinstall is the long one. Stopping it
+        # early leaves the installer unfinished and sshd not yet enabled.
+        deadline = time.time() + 8 * 60 * 60
         while time.time() < deadline:
             text = status_text(image)
             if "BOOTSTRAP" in text:
