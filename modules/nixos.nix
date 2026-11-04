@@ -194,6 +194,8 @@ let
         if [[ -d "$vm_dir" && ! -f "$vm_dir/vm.toml" ]]; then
           rm -rf "$vm_dir"
         fi
+        # Wiping the directory leaves the name in reims-ctl's registry.
+        "$reims_ctl" delete "$name" --yes >/dev/null 2>&1 || true
         args=(
           create "$name"
           --macos ${lib.escapeShellArg cfg.macos}
