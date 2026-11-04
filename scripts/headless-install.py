@@ -324,6 +324,45 @@ exit 0
             raise RuntimeError(f"package is missing {name}: {listing}")
 
 
+def build_product(stage: Path, component: Path, product: Path) -> None:
+    # startosinstall --installpackage takes a product archive (what
+    # productbuild writes), a distribution plus the component package.
+    dist = stage / "product"
+    if dist.exists():
+        shutil.rmtree(dist)
+    dist.mkdir()
+    shutil.copy(component, dist / "bootstrap-component.pkg")
+    (dist / "Distribution").write_text(
+        """<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<installer-gui-script minSpecVersion="1">
+    <title>macos-kvm</title>
+    <options customize="never" require-scripts="false" hostArchitectures="x86_64"/>
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.macos-kvm.bootstrap"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.macos-kvm.bootstrap" visible="false" title="bootstrap">
+        <pkg-ref id="com.macos-kvm.bootstrap"/>
+    </choice>
+    <pkg-ref id="com.macos-kvm.bootstrap" version="1.0" onConclusion="none">#bootstrap-component.pkg</pkg-ref>
+</installer-gui-script>
+"""
+    )
+    if product.exists():
+        product.unlink()
+    subprocess.run(
+        ["xar", "--compression", "none", "-cf", str(product), "Distribution", "bootstrap-component.pkg"],
+        cwd=dist,
+        check=True,
+    )
+    listing = capture(["xar", "-tf", str(product)])
+    for name in ("Distribution", "bootstrap-component.pkg"):
+        if name not in listing.split():
+            raise RuntimeError(f"product archive is missing {name}: {listing}")
+
+
 # Recovery is bash-as-sh. The awk is nawk: no GNU capture groups.
 GO_SH = r"""#!/bin/sh
 # The host types: diskutil mount MACOSKVM; sh /Volumes/MACOSKVM/go.sh
@@ -421,8 +460,10 @@ def build_image(vm_dir: Path, account: str, password: str) -> Path:
     if stage.exists():
         shutil.rmtree(stage)
     account_files(account, password, stage)
+    component = stage / "component.pkg"
     pkg = stage / "bootstrap.pkg"
-    build_pkg(stage, pkg)
+    build_pkg(stage, component)
+    build_product(stage, component, pkg)
     (stage / "go.sh").write_text(GO_SH)
     os.chmod(stage / "go.sh", 0o755)
     (stage / "status").write_bytes(b"")
