@@ -38,7 +38,7 @@ Apple's license still applies to the guest. The installer is downloaded from App
 
 `nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and installs macOS. Nothing in Recovery is clicked. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
 
-The install is headless. It downloads Apple's full installer (about 17 GiB), types Command-Shift-T into Recovery over the QMP socket, and runs a script from a small disk. That script erases the guest disk and starts `startosinstall --nointeraction` with a package. The package's first-boot daemon creates the account, turns on SSH and auto-login, skips Setup Assistant, and sets Metal's error mode (without that, the desktop has no menu bar). When SSH answers, the window opens on the installed system.
+The install is headless. It downloads Apple's full installer (about 17 GiB) and types Command-Shift-T into Recovery once, over the QMP socket. The script on the small disk erases the guest disk, expands `InstallAssistant.pkg` the way mist does (`CM_BUILD=CM_BUILD installer -pkg`), and runs `startosinstall --agreetolicense --nointeraction --forcequitapps --volume`. Nothing is typed after that. When startosinstall reboots, Apple's image is ejected so OpenCore boots the internal disk instead of returning to the Recovery window. When SSH answers, the window opens.
 
 ```sh
 macos-kvm            # install if needed, then open the window

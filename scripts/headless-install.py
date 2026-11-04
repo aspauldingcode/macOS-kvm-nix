@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Install macOS without showing the Recovery installer.
 
-Recovery's Terminal shortcut is Command-Shift-T. This types it on the guest's
-USB keyboard through QEMU's QMP socket, the same chord NixThePlanet sends with
-VNC, without screenshots or OCR. A small FAT disk carries the script and a
-package. The package's LaunchDaemon creates the account, turns on SSH, skips
-Setup Assistant, and sets the Metal error mode Reims needs for a menu bar.
-The host watches a status file on that disk and the guest's reboot, then
-ejects Apple's installer so OpenCore boots the new system.
+Recovery's Terminal shortcut is Command-Shift-T. This types it once, on the
+guest's USB keyboard through QEMU's QMP socket, without screenshots or OCR.
+The FAT disk's script then runs startosinstall the way mist does: the
+installer package is expanded onto the target, and startosinstall is
+--agreetolicense --nointeraction --forcequitapps --volume. Nothing is typed
+after that. Apple's image is ejected on the reboot so OpenCore boots the
+internal disk instead of returning to the Recovery window.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -444,8 +445,10 @@ rm -f "$link"
 chmod -R 755 "$app"
 echo STARTOSINSTALL
 sync
+# mist's install, plus the two flags that keep it from stopping on a dialog:
+# agree to the license, don't ask, quit apps that would block the reboot.
 "$app/Contents/Resources/startosinstall" --agreetolicense --nointeraction \
-  --installpackage /Volumes/MACOSKVM/bootstrap.pkg --volume "$target"
+  --forcequitapps --volume "$target"
 status=$?
 # Exit 0 means it staged the install and asked the system to reboot. The
 # process returns before the reboot, so a following echo must not look like
@@ -672,9 +675,11 @@ def wait_reboot(name: str, image: Path, reims: str, timeout: float) -> None:
 
 
 def ssh_up(port: int) -> bool:
+    """slirp accepts the forward even when sshd is down, so the banner is the check."""
     try:
-        with socket.create_connection(("127.0.0.1", port), 2):
-            return True
+        with socket.create_connection(("127.0.0.1", port), 2) as sock:
+            sock.settimeout(2)
+            return sock.recv(32).startswith(b"SSH-")
     except OSError:
         return False
 
@@ -688,12 +693,66 @@ def show_window(reims: str, name: str) -> None:
         log(f"could not open the window: {err}")
 
 
+def installer_attached(reims: str, name: str) -> bool:
+    try:
+        show = capture([reims, "show", name])
+    except subprocess.CalledProcessError:
+        return False
+    for line in show.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "installer" and parts[1] != "none":
+            return True
+    return False
+
+
+def continue_staged(args: argparse.Namespace) -> None:
+    """startosinstall already staged this disk. Boot it, and do not type.
+
+    Apple's installer image is what OpenCore boots when it is attached, which
+    puts the guest back in the Recovery window. The staged install is on the
+    internal disk, so that image has to stay ejected.
+    """
+    name = args.name
+    log(f"{name} already has a staged install; booting the internal disk")
+    if installer_attached(args.reims, name) or not vm_running(args.reims, name):
+        stop_vm(args.reims, name)
+        run([args.reims, "eject", name])
+        set_env(args.reims, name, headless=True)
+        start_vm(args.reims, name)
+    log(f"waiting for SSH on 127.0.0.1:{args.ssh_port}")
+    deadline = time.time() + 3 * 60 * 60
+    while time.time() < deadline:
+        if ssh_up(args.ssh_port):
+            time.sleep(45)
+            if ssh_up(args.ssh_port):
+                break
+        time.sleep(15)
+    else:
+        raise RuntimeError("SSH did not stay up")
+    stop_vm(args.reims, name)
+    set_env(args.reims, name, headless=False)
+    attach_bootstrap(args.reims, name, None)
+    start_vm(args.reims, name)
+    (vm_dir(name) / "headless-installed").write_text("ok\n")
+    log(f"{name} is installed. Open it with: macos-kvm")
+
+
 def install(args: argparse.Namespace) -> None:
     name = args.name
     directory = vm_dir(name)
     stamp = directory / "headless-installed"
+    staged = directory / "install-staged"
     if stamp.exists():
         log(f"{name} is already installed")
+        return
+    lock = os.open(directory / "install.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log(f"{name} install is already running")
+        return
+    if staged.exists():
+        continue_staged(args)
         return
     password = password_for(name, args.password_file)
     log(f"macOS account is {args.account}")
@@ -728,6 +787,7 @@ def install(args: argparse.Namespace) -> None:
         wait_status(image, "STARTOSINSTALL", 3 * 60 * 60)
         log("startosinstall is running, waiting for its reboot")
         wait_reboot(name, image, args.reims, 3 * 60 * 60)
+        staged.write_text("ok\n")
         stop_vm(args.reims, name)
         run([args.reims, "eject", name])
         # Apple's image stays ejected. OpenCore would boot it again otherwise.
@@ -754,6 +814,9 @@ def install(args: argparse.Namespace) -> None:
         stamp.write_text("ok\n")
         log(f"{name} is installed. Open it with: macos-kvm")
     except Exception:
+        if staged.exists():
+            log("staged install stays on the disk; Recovery is not opened again")
+            raise
         log("install did not finish; opening the window so the guest is visible")
         show_window(args.reims, name)
         raise
