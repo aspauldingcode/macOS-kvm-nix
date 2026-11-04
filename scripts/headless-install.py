@@ -344,6 +344,8 @@ cp "$SRC/kcpassword" /etc/kcpassword
 chmod 600 /etc/kcpassword
 cp "$SRC/loginwindow.plist" /Library/Preferences/com.apple.loginwindow.plist
 touch /var/db/.AppleSetupDone
+# This cookie is what makes the first login stop on the license window.
+rm -f /var/db/.AppleSetupTermsOfService
 mkdir -p /Users/{account}/.ssh /Users/{account}/SHARED_FOLDER
 cp "$SRC/authorized_keys" /Users/{account}/.ssh/authorized_keys
 cp "$SRC/guest_id_ed25519" /Users/{account}/.ssh/id_ed25519
