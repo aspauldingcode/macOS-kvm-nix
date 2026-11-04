@@ -458,6 +458,7 @@ in
         ExecStart = "${session}/bin/macos-kvm ensure";
         ExecStop = "${session}/bin/macos-kvm stop ${cfg.name} --timeout ${toString cfg.stopTimeout}";
       };
+    };
     })
     (lib.mkIf (cfg.enable && options ? home-manager) {
       home-manager.users.${cfg.user}.programs.ssh.includes = [
