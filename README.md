@@ -36,14 +36,14 @@ Apple's license still applies to the guest. The installer is downloaded from App
 }
 ```
 
-`nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and starts it. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
+`nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and installs macOS. Nothing in Recovery is clicked. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
 
-The first window is macOS Recovery. Erase the QEMU disk as APFS, reinstall macOS, then from Recovery set Metal's error mode or the desktop comes up without a menu bar:
+The install is headless. It downloads Apple's full installer (about 17 GiB), types Command-Shift-T into Recovery over the QMP socket, and runs a script from a small disk. That script erases the guest disk and starts `startosinstall --nointeraction` with a package. The package's first-boot daemon creates the account, turns on SSH and auto-login, skips Setup Assistant, and sets Metal's error mode (without that, the desktop has no menu bar). When SSH answers, the window opens on the installed system.
 
 ```sh
-cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot
+macos-kvm            # install if needed, then open the window
+macos-kvm account    # print the generated password
+macos-kvm show tahoe
 ```
 
-Then `macos-kvm eject tahoe`. Later logins start the installed guest.
-
-`macos-kvm` is `reims-ctl` with this host's Vulkan environment. `macos-kvm show tahoe` prints the Mac serial OpenCore generated.
+The password file is `~/.local/share/reims-ctl/vms/tahoe/account.password` (mode 0600). Set `macos-kvm.accountPasswordFile` to a runtime path to choose one. A password written in the NixOS configuration would land in the world-readable store.

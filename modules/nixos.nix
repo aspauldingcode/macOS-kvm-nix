@@ -5,10 +5,11 @@
 # commands on Vulkan through metal2vulkan, and each display is a window:
 # Wayland or X11, HiDPI, and resizable when the window is not borderless.
 #
-# `nh os switch` installs the toolchain and, at the next graphical session,
-# creates the VM if it is not there yet (Apple's installer, OpenCore, an
-# empty APFS-ready disk) and starts it. The disk lives under the user's
-# XDG data directory, not in the Nix store: Apple's image is machine state.
+# `nh os switch` installs the toolchain. At the next graphical session the
+# user service creates the VM if it is missing and installs macOS with no
+# clicks: Command-Shift-T over QMP, a script on a small disk, and a package
+# the installer applies itself. The disk lives under the user's XDG data
+# directory, not in the Nix store: Apple's image is machine state.
 { self }:
 {
   config,
@@ -19,8 +20,34 @@
 let
   cfg = config.macos-kvm;
   reims = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  account = if cfg.accountName == null then cfg.user else cfg.accountName;
 
   nvidiaIcd = "/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json";
+
+  # mkbom writes the file name into a one-byte char array that is allocated
+  # to the real length. glibc's fortify check aborts that copy.
+  bomutils = pkgs.bomutils.overrideAttrs (old: {
+    hardeningDisable = (old.hardeningDisable or [ ]) ++ [ "fortify" ];
+  });
+
+  # Host tools for the headless install. The guest runs the shell script;
+  # these build the disk it is on and talk to QMP.
+  installer = pkgs.writeShellScriptBin "macos-kvm-install" ''
+    export PATH="${
+      lib.makeBinPath [
+        pkgs.python3
+        pkgs.mtools
+        pkgs.util-linux
+        bomutils
+        pkgs.xar
+        pkgs.cpio
+        pkgs.gzip
+        pkgs.procps
+        pkgs.coreutils
+      ]
+    }:$PATH"
+    exec ${pkgs.python3}/bin/python3 ${../scripts/headless-install.py} "$@"
+  '';
 
   primeEnv = lib.optionals cfg.primeOffload [
     "__NV_PRIME_RENDER_OFFLOAD=1"
@@ -35,6 +62,7 @@ let
     name = "macos-kvm";
     runtimeInputs = [
       reims
+      installer
       pkgs.coreutils
       pkgs.gnugrep
     ];
@@ -60,10 +88,18 @@ let
       ${lib.concatMapStrings (line: "export ${line}\n") primeEnv}
 
       name=${lib.escapeShellArg cfg.name}
+      account=${lib.escapeShellArg account}
+      password_file=${lib.escapeShellArg (if cfg.accountPasswordFile == null then "" else cfg.accountPasswordFile)}
 
-      if [[ "''${1:-}" != ensure ]]; then
-        exec reims-ctl "$@"
-      fi
+      cmd="''${1:-open}"
+      case "$cmd" in
+        open|ensure) ;;
+        account)
+          cat "$HOME/.local/share/reims-ctl/vms/$name/account.password"
+          exit 0
+          ;;
+        *) exec reims-ctl "$@" ;;
+      esac
 
       if ! reims-ctl show "$name" >/dev/null 2>&1; then
         args=(
@@ -100,6 +136,18 @@ let
         }
         reims-ctl "''${args[@]}"
       fi
+
+      install_args=(
+        run
+        --name "$name"
+        --account "$account"
+        --macos ${lib.escapeShellArg cfg.macos}
+        --ssh-port ${toString (if cfg.sshPort == null then 2222 else cfg.sshPort)}
+      )
+      if [[ -n "$password_file" ]]; then
+        install_args+=(--password-file "$password_file")
+      fi
+      macos-kvm-install "''${install_args[@]}"
 
       state_line="$(reims-ctl show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]')"
       # "state    running (pid N)" or "state    stopped"
@@ -139,13 +187,33 @@ in
       '';
     };
 
+    accountName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Account created on the guest. Null uses macos-kvm.user. The password
+        is generated into the VM directory unless accountPasswordFile is set.
+      '';
+    };
+
+    accountPasswordFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Runtime path of a file containing the guest account password. A nix
+        path would be copied into the world-readable store, so this is a
+        string read when the install runs. Null generates a password at
+        ~/.local/share/reims-ctl/vms/<name>/account.password (mode 0600).
+      '';
+    };
+
     offline = lib.mkOption {
       type = lib.types.bool;
-      default = false;
+      default = true;
       description = ''
-        Download one full installer (about 13–20 GiB) instead of Apple's
-        recovery image (about 1 GiB). Recovery then installs without the
-        guest fetching the OS.
+        Download the full installer (about 17 GiB) when the VM is created.
+        The headless install uses that image either way: Recovery's small
+        image does not contain startosinstall.
       '';
     };
 
@@ -218,8 +286,8 @@ in
       type = lib.types.bool;
       default = true;
       description = ''
-        Create the VM if it is missing, then start it, when the graphical
-        session starts.
+        On a graphical session: create the VM if it is missing, install macOS
+        if the disk is empty, then start the window.
       '';
     };
 
@@ -245,6 +313,10 @@ in
       {
         assertion = pkgs.stdenv.hostPlatform.isx86_64 && pkgs.stdenv.hostPlatform.isLinux;
         message = "macos-kvm runs an x86-64 macOS guest and is built for x86_64-linux.";
+      }
+      {
+        assertion = cfg.sshPort != null;
+        message = "macos-kvm.sshPort is how the headless install knows the guest booted.";
       }
     ];
 
