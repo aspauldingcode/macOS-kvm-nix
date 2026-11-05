@@ -1,0 +1,85 @@
+--- a/hw/display/apple-gfx.c
++++ b/hw/display/apple-gfx.c
+@@ -457,6 +457,7 @@
+     APPLE_GFX_EVENT_SCROLL,
+     APPLE_GFX_EVENT_KEY,
+     APPLE_GFX_EVENT_CLOSE,
++    APPLE_GFX_EVENT_RESIZE,
+ } AppleGFXEventKind;
+ 
+ struct AppleGFXEvent {
+@@ -478,6 +479,10 @@
+             uint16_t usage;
+             bool down;
+         } key;
++        struct {
++            uint16_t width;
++            uint16_t height;
++        } resize;
+     };
+ };
+ 
+@@ -506,6 +511,9 @@
+     qemu_bh_schedule(s->event_bh);
+ }
+ 
++static void apple_gfx_apply_resize(AppleGFXDisplay *d, uint16_t width,
++                                   uint16_t height);
++
+ static void apple_gfx_event_run(AppleGFXEvent *event)
+ {
+     AppleGFXDisplay *d = event->d;
+@@ -536,6 +544,9 @@
+     case APPLE_GFX_EVENT_CLOSE:
+         apple_gfx_input_close();
+         break;
++    case APPLE_GFX_EVENT_RESIZE:
++        apple_gfx_apply_resize(d, event->resize.width, event->resize.height);
++        break;
+     default:
+         g_assert_not_reached();
+     }
+@@ -917,6 +928,35 @@
+     apple_gfx_event_push(apple_gfx_event_new(ctx, APPLE_GFX_EVENT_CLOSE));
+ }
+ 
++/*
++ * The window settled on a new size. The library calls this on its UI thread, so the
++ * mode list is replaced on the BH, under the BQL, not here.
++ */
++static void apple_gfx_window_resize_cb(void *ctx, uint16_t width, uint16_t height)
++{
++    AppleGFXEvent *event = apple_gfx_event_new(ctx, APPLE_GFX_EVENT_RESIZE);
++
++    event->resize.width = width;
++    event->resize.height = height;
++    apple_gfx_event_push(event);
++}
++
++/* One mode, the size the window asked for. The guest switches to it. */
++static void apple_gfx_apply_resize(AppleGFXDisplay *d, uint16_t width,
++                                   uint16_t height)
++{
++    RvgDisplayMode mode = {
++        .width = width,
++        .height = height,
++        .refresh_rate_hz = 60,
++    };
++
++    if (!d->pgdisp || width < 640 || height < 480) {
++        return;
++    }
++    rvg_display_set_modes(d->pgdisp, &mode, 1);
++}
++
+ static RvgDisplayMode *apple_gfx_new_display_modes(
+     const AppleGFXDisplayMode display_modes[], uint32_t display_mode_count)
+ {
+@@ -1098,6 +1138,7 @@
+         .key = apple_gfx_window_key_cb,
+         .close = apple_gfx_window_close_cb,
+         .scroll = apple_gfx_window_scroll_cb,
++        .resize = apple_gfx_window_resize_cb,
+     };
+     /*
+      * Unless display-modes names some, the library offers the resolution

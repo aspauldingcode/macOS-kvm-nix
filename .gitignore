@@ -3,3 +3,4 @@ result-*
 .direnv
 *.qcow2
 .DS_Store
+target

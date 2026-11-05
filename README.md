@@ -1,6 +1,6 @@
 # macOS-kvm-nix
 
-x86-64 macOS guests on Linux KVM, with [Reims vGPU](https://reims-vgpu.com/): Metal commands from the guest's own `AppleParavirtGPU` driver run on the host's Vulkan GPU through metal2vulkan. Each display is a window (Wayland or X11), HiDPI when asked, and resizable unless the window is borderless.
+x86-64 macOS guests on Linux KVM, with [Reims vGPU](https://reims-vgpu.com/): Metal commands from the guest's own `AppleParavirtGPU` driver run on the host's Vulkan GPU through metal2vulkan. Each display is a Reims window (Wayland or X11), not a virtio-gpu scanout. HiDPI when asked. Dragging the window, once it has settled, changes the guest's display mode.
 
 macOS 26 Tahoe is the last Intel release. The guest is KVM, not emulation. The CPU model is reims-ctl's Skylake-Client (`+invtsc`, `vmware-cpuid-freq`), which Tahoe boots. vCPUs and RAM default to half the host (2–8 cores, 4–16 GiB).
 
@@ -26,6 +26,9 @@ Apple's license still applies to the guest. The installer is downloaded from App
         {
           macos-kvm.enable = true;
           macos-kvm.user = "alex";
+          macos-kvm.accountName = "alex";       # guest short name
+          macos-kvm.accountPassword = "change-me"; # world-readable in the Nix store
+          macos-kvm.loginWindow = false;        # boot straight into the desktop
           macos-kvm.primeOffload = true; # hybrid NVIDIA
           macos-kvm.hidpi = true;        # 3840x2160 framebuffer, looks like 1920x1080
           macos-kvm.borderless = false;  # resizable window
@@ -36,9 +39,13 @@ Apple's license still applies to the guest. The installer is downloaded from App
 }
 ```
 
-`nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and installs macOS. Nothing in Recovery is clicked. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
+`nh os switch` installs `reims-ctl`, `reims-util`, and the QEMU linked against reims-vgpu. On the next graphical session a user service creates the VM if it is missing and installs macOS. The window stays hidden while that runs, and a desktop notification says that macOS is being set up. The disk, OpenCore image, and Apple installer stay in the user's XDG data directory (`~/.local/share/reims-ctl`).
 
-The install is headless. It downloads Apple's full installer (about 17 GiB) and types Command-Shift-T into Recovery once, over the QMP socket. The script on the small disk erases the guest disk, expands `InstallAssistant.pkg` the way mist does (`CM_BUILD=CM_BUILD installer -pkg`), and runs `startosinstall --agreetolicense --nointeraction --forcequitapps --volume` with one package. That package is what the first boot uses to create the account, turn on auto-login and SSH, skip Setup Assistant, set Metal's error mode, and mount the shared folder. Nothing is typed after the script starts. When startosinstall reboots, Apple's image is ejected so OpenCore boots the internal disk instead of returning to the Recovery window. When SSH answers, the window opens on the logged-in desktop.
+The install is silent. The window stays hidden and the speaker stays off until the desktop is up. It downloads Apple's full installer (about 17 GiB) and types Command-Shift-T into Recovery once, over the QMP socket. The script on the small disk erases the guest disk, expands `InstallAssistant.pkg` the way mist does (`CM_BUILD=CM_BUILD installer -pkg`), and runs `startosinstall --agreetolicense --nointeraction --forcequitapps --volume` with one package. That package, and a Recovery script that writes the same files onto the Data volume when the package does not land, creates the account, turns on SSH, skips Setup Assistant, sets Metal's error mode, and mounts the shared folder. With `loginWindow = false` (the default) it also signs that account in, so the first window is the desktop. Nothing is typed after the script starts. When startosinstall reboots, Apple's image is ejected so OpenCore boots the internal disk instead of returning to the Recovery window. When SSH answers, the window opens and the speaker comes back.
+
+`accountName` is the guest's short name (`macos-kvm.user` when it is left null). `accountPassword` sets the password. Changing it later, then starting the guest, changes the password of the account that was installed; it does not reinstall macOS. `loginWindow = true` shows the login window instead. Changing that later is applied the same way. `accountPassword` is stored in the NixOS system, which every user on the machine can read. `accountPasswordFile` is a runtime path for a password that must stay out of the store. Leaving both unset generates one at `~/.local/share/reims-ctl/vms/tahoe/account.password` (mode 0600).
+
+A StatusNotifier item (a menubar applet, in Waybar's tray) can open, start, stop, restart, show, or quit the guest. virtio-net carries the shared folder and SSH. The display stays the Reims GPU: a window resize offers the new size through `rvg_display_set_modes`, and the guest switches to it. virtio-gpu is not the display.
 
 OpenCore's serial, board serial, UUID, and ROM come from `macserial`, the same program [osx-serial-generator](https://github.com/sickcodes/osx-serial-generator) runs, for an iMac20,1. They are written into reims-util's OpenCore image, which keeps `ReimsVgpu.kext`. The generator's own boot disk is not used.
 
@@ -52,4 +59,4 @@ macos-kvm show tahoe
 ssh tahoe            # same guest, from the host ssh config
 ```
 
-The password file is `~/.local/share/reims-ctl/vms/tahoe/account.password` (mode 0600). Set `macos-kvm.accountPasswordFile` to a runtime path to choose one. A password written in the NixOS configuration would land in the world-readable store.
+`macos-kvm account` prints the password the guest is using. A password set with `accountPassword` is also in the Nix store.

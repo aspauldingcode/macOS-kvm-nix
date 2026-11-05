@@ -4,6 +4,7 @@
 {
   lib,
   stdenv,
+  applyPatches,
   fetchFromGitHub,
   fetchzip,
   callPackage,
@@ -75,6 +76,21 @@ let
     repo = "qemu-reims-vgpu";
     rev = "1b41f5f5db4d1067d023973b9bd74c7b341e0d28";
     hash = "sha256-wXy4+i/kwHxrMBkbUij5396DwbrIVzrcxV47YvehQnA=";
+  };
+
+  # A person's resize of the window offers that size to the guest. The image
+  # was only scaled before. The vendor dirs stay on the unpatched sources:
+  # neither patch changes a Cargo.lock.
+  reimsPatched = applyPatches {
+    name = "reims-vgpu-resize";
+    src = reimsSrc;
+    patches = [ ./patches/reims-window-resize.patch ];
+  };
+
+  qemuPatched = applyPatches {
+    name = "qemu-reims-vgpu-resize";
+    src = qemuSrc;
+    patches = [ ./patches/qemu-window-resize.patch ];
   };
 
   utilSrc = fetchFromGitHub {
@@ -187,7 +203,7 @@ let
   dist = stdenv.mkDerivation {
     pname = "reims-vgpu-dist";
     version = "1fe0acb";
-    src = reimsSrc;
+    src = reimsPatched;
 
     nativeBuildInputs = [
       rust
@@ -228,7 +244,7 @@ let
   qemu = stdenv.mkDerivation {
     pname = "qemu-reims-vgpu";
     version = "11.1.50-1b41f5f";
-    src = qemuSrc;
+    src = qemuPatched;
 
     nativeBuildInputs = [
       pkg-config

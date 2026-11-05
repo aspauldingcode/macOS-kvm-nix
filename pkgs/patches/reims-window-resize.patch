@@ -1,0 +1,422 @@
+diff --git a/crates/reims-vgpu-c/include/reims_vgpu.h b/crates/reims-vgpu-c/include/reims_vgpu.h
+index 679703a..9b43add 100644
+--- a/crates/reims-vgpu-c/include/reims_vgpu.h
++++ b/crates/reims-vgpu-c/include/reims_vgpu.h
+@@ -697,6 +697,15 @@ typedef struct {
+ // `wheel`.
+ typedef void (*RvgWindowScrollFn)(void *ctx, const RvgWindowScroll *scroll);
+ 
++// `resize(ctx, width, height)`: the person resized the window, and it has settled.
++// `width` and `height` are the guest mode, in pixels, that fills the window at the
++// scale the guest already runs. Each side is a multiple of 8. The host replaces the
++// display's modes (rvg_display_set_modes). Without it, a resize only scales the image.
++//
++// Thread, and what it may call: as RvgWindowPointerFn. Do not call
++// rvg_display_set_modes on this thread; queue it onto the host's thread.
++typedef void (*RvgWindowResizeFn)(void *ctx, uint16_t width, uint16_t height);
++
+ // A window's callbacks.
+ typedef struct {
+   // sizeof(RvgWindowCallbacks) as the host was compiled.
+@@ -710,6 +719,8 @@ typedef struct {
+   RvgWindowKeyFn key;
+   RvgWindowCloseFn close;
+   RvgWindowScrollFn scroll;
++  // Absent when struct_size ends at `scroll` (64). A later host passes the field.
++  RvgWindowResizeFn resize;
+ } RvgWindowCallbacks;
+ 
+ // A display's window (RvgDisplayConfig's `window`).
+diff --git a/crates/reims-vgpu-c/src/window.rs b/crates/reims-vgpu-c/src/window.rs
+index 4d0e6e0..c87ee12 100644
+--- a/crates/reims-vgpu-c/src/window.rs
++++ b/crates/reims-vgpu-c/src/window.rs
+@@ -9,7 +9,7 @@ use std::ffi::c_void;
+ use std::sync::Arc;
+ 
+ use reims_vgpu::{
+-    CloseFn, KeyFn, MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
++    CloseFn, KeyFn, MomentumPhase, PointerFn, ResizeFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
+     WindowCallbacks, WindowConfig,
+ };
+ 
+@@ -151,6 +151,15 @@ pub struct RvgWindowScroll {
+ pub type RvgWindowScrollFn =
+     Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, scroll: *const RvgWindowScroll)>;
+ 
++/// `resize(ctx, width, height)`: the person resized the window, and it has settled.
++/// `width` and `height` are the guest mode, in pixels, that fills the window at the
++/// scale the guest already runs. Each side is a multiple of 8.
++///
++/// Thread, and what it may call: as RvgWindowPointerFn. Do not call
++/// `rvg_display_set_modes` on this thread; queue it onto the host's thread.
++pub type RvgWindowResizeFn =
++    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, width: u16, height: u16)>;
++
+ /// A window's callbacks.
+ #[repr(C)]
+ #[derive(Clone, Copy)]
+@@ -170,6 +179,8 @@ pub struct RvgWindowCallbacks {
+     pub key: RvgWindowKeyFn,
+     pub close: RvgWindowCloseFn,
+     pub scroll: RvgWindowScrollFn,
++    /// Absent when `struct_size` ends at `scroll` (64).
++    pub resize: RvgWindowResizeFn,
+ }
+ 
+ // SAFETY: repr(C), a u32 first; a pointer and optional function pointers.
+@@ -182,6 +193,10 @@ unsafe impl HostStruct for RvgWindowCallbacks {
+ const _: () =
+     assert!(std::mem::offset_of!(RvgWindowCallbacks, scroll) == RvgWindowCallbacks::V1_SIZE);
+ 
++/// The current table ends at `resize`. A host built before it passes 64 and has no
++/// `resize`; the bytes past its `struct_size` stay zero, so the callback is absent.
++const _: () = assert!(std::mem::offset_of!(RvgWindowCallbacks, resize) == 64);
++
+ /// `phase`'s RVG_WINDOW_SCROLL_PHASE_*.
+ fn phase_value(phase: ScrollPhase) -> u32 {
+     match phase {
+@@ -343,6 +358,14 @@ pub(crate) fn window_callbacks(t: &Arc<Table>, c: &RvgWindowCallbacks) -> Window
+             });
+             c
+         }),
++        resize: c.resize.map(|f| {
++            let t = t.clone();
++            let c: ResizeFn = Arc::new(move |width, height| {
++                // SAFETY: the host's function over its ctx.
++                ffi::host_call("resize", || unsafe { f(t.ctx(), width, height) });
++            });
++            c
++        }),
+     }
+ }
+ 
+diff --git a/crates/reims-vgpu-c/src/window/tests.rs b/crates/reims-vgpu-c/src/window/tests.rs
+index cf71b84..74ffca9 100644
+--- a/crates/reims-vgpu-c/src/window/tests.rs
++++ b/crates/reims-vgpu-c/src/window/tests.rs
+@@ -24,6 +24,9 @@ unsafe extern "C-unwind" fn t_key(ctx: *mut c_void, usage: u16, down: bool) {
+ unsafe extern "C-unwind" fn t_close(ctx: *mut c_void) {
+     Rec::push(ctx, "close".to_owned());
+ }
++unsafe extern "C-unwind" fn t_resize(ctx: *mut c_void, width: u16, height: u16) {
++    Rec::push(ctx, format!("resize {width}x{height}"));
++}
+ unsafe extern "C-unwind" fn t_scroll(ctx: *mut c_void, scroll: *const RvgWindowScroll) {
+     // SAFETY: the library's event, live for the call.
+     let s = unsafe { &*scroll };
+@@ -53,6 +56,7 @@ fn window_table(rec: &Arc<Rec>) -> RvgWindowCallbacks {
+         key: Some(t_key),
+         close: Some(t_close),
+         scroll: Some(t_scroll),
++        resize: None,
+     }
+ }
+ 
+@@ -300,7 +304,7 @@ fn scroll_phases_are_their_constants() {
+ fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
+     assert_eq!(<RvgWindowCallbacks as HostStruct>::V1_SIZE, 56);
+     assert_eq!(std::mem::offset_of!(RvgWindowCallbacks, scroll), 56);
+-    assert_eq!(size_of::<RvgWindowCallbacks>(), 64);
++    assert_eq!(size_of::<RvgWindowCallbacks>(), 72);
+     let rec = Rec::new();
+     // A v1 table, followed in memory by a scroll callback it does not have.
+     let mut c = window_table(&rec);
+@@ -309,9 +313,14 @@ fn a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll() {
+     let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
+     assert!(read.scroll.is_none() && read.close.is_some());
+     c.struct_size = 64;
++    // SAFETY: as above. A host of that version has scroll, and no resize.
++    let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
++    assert!(read.scroll.is_some() && read.resize.is_none());
++    c.resize = Some(t_resize);
++    c.struct_size = 72;
+     // SAFETY: as above.
+     let read = unsafe { sized::read(&raw const c) }.unwrap().unwrap();
+-    assert!(read.scroll.is_some());
++    assert!(read.resize.is_some());
+     c.struct_size = 55;
+     // SAFETY: as above.
+     assert_eq!(
+diff --git a/crates/reims-vgpu-window/src/config.rs b/crates/reims-vgpu-window/src/config.rs
+index eb60b39..792aef1 100644
+--- a/crates/reims-vgpu-window/src/config.rs
++++ b/crates/reims-vgpu-window/src/config.rs
+@@ -86,6 +86,11 @@ pub type ScrollFn = Arc<dyn Fn(ScrollEvent) + Send + Sync>;
+ pub type KeyFn = Arc<dyn Fn(u16, bool) + Send + Sync>;
+ /// The person closed the window, or chose Quit: the host ends the VM.
+ pub type CloseFn = Arc<dyn Fn() + Send + Sync>;
++/// `(width, height)`: the person resized the window, and it has settled. The pair is the guest
++/// mode, in pixels, that fills the window at the scale the guest already runs. Each side is a
++/// multiple of 8. The host replaces the display's modes. It runs on the UI thread and must not
++/// call `set_modes` there: queue that onto the host's thread.
++pub type ResizeFn = Arc<dyn Fn(u16, u16) + Send + Sync>;
+ 
+ /// A window's callbacks, each on the UI thread (the module doc). `None` is a callback the host does not give:
+ /// that input goes nowhere.
+@@ -102,6 +107,8 @@ pub struct WindowCallbacks {
+     /// The wheel or a trackpad scrolled, smoothly and as notches. With it, scrolling comes here
+     /// and not to `wheel`.
+     pub scroll: Option<ScrollFn>,
++    /// The person resized the window. `None` leaves the guest's mode and scales the image.
++    pub resize: Option<ResizeFn>,
+ }
+ 
+ impl std::fmt::Debug for WindowCallbacks {
+@@ -112,6 +119,7 @@ impl std::fmt::Debug for WindowCallbacks {
+             .field("key", &self.key.is_some())
+             .field("close", &self.close.is_some())
+             .field("scroll", &self.scroll.is_some())
++            .field("resize", &self.resize.is_some())
+             .finish()
+     }
+ }
+diff --git a/crates/reims-vgpu-window/src/handle.rs b/crates/reims-vgpu-window/src/handle.rs
+index 23a62a2..a787964 100644
+--- a/crates/reims-vgpu-window/src/handle.rs
++++ b/crates/reims-vgpu-window/src/handle.rs
+@@ -491,6 +491,17 @@ impl Window {
+         self.callbacks.lock().clone()
+     }
+ 
++    /// The person settled on a window size. `width` and `height` are the guest mode, in pixels,
++    /// that fills it. The callback runs on this thread (the UI thread) and only queues work.
++    pub(crate) fn user_resized(&self, width: u16, height: u16) {
++        let Some(callbacks) = self.callbacks() else {
++            return;
++        };
++        if let Some(resize) = &callbacks.resize {
++            resize(width, height);
++        }
++    }
++
+     /// Hands each of `events`, in order, to `send` with the host's callbacks, while the window
+     /// lives: the window's end ([`Window::close`]) drops the events not yet sent, so no callback
+     /// of the host's starts after the end has returned, but the one the UI thread was making.
+diff --git a/crates/reims-vgpu-window/src/lib.rs b/crates/reims-vgpu-window/src/lib.rs
+index ffa5f62..6ee71a3 100644
+--- a/crates/reims-vgpu-window/src/lib.rs
++++ b/crates/reims-vgpu-window/src/lib.rs
+@@ -61,8 +61,8 @@ mod sdl;
+ 
+ pub use config::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+-    MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
+-    WindowConfig,
++    MomentumPhase, PointerFn, ResizeFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
++    WindowCallbacks, WindowConfig,
+ };
+ pub use handle::{DrawnCursor, FrameSink, Glyph, PixelRect, Window};
+ pub use policy::{Density, OfferedMode};
+diff --git a/crates/reims-vgpu-window/src/native/linux/ui.rs b/crates/reims-vgpu-window/src/native/linux/ui.rs
+index e184c5f..d7b8119 100644
+--- a/crates/reims-vgpu-window/src/native/linux/ui.rs
++++ b/crates/reims-vgpu-window/src/native/linux/ui.rs
+@@ -230,7 +230,15 @@ fn run() {
+         // SAFETY: an all-zero event is a valid one for SDL to fill.
+         let mut event: SDL_Event = unsafe { std::mem::zeroed() };
+         // SAFETY: SDL's video runs on this thread.
+-        if unsafe { SDL_WaitEventTimeout(&mut event, WAIT_MS) } {
++        // A person's resize is told to the guest once it has stayed still. While one is
++        // pending the wait is that settle time, so the mode is offered without another event.
++        let wait = if crate::sdl::shell::resize_pending() {
++            200
++        } else {
++            WAIT_MS
++        };
++        // SAFETY: SDL's video runs on this thread.
++        if unsafe { SDL_WaitEventTimeout(&mut event, wait) } {
+             dispatch(&event);
+             // SAFETY: as above.
+             while unsafe { SDL_PollEvent(&mut event) } {
+@@ -238,6 +246,7 @@ fn run() {
+             }
+             crate::sdl::shell::batch_over();
+         }
++        crate::sdl::shell::flush_resizes();
+     }
+ }
+ 
+diff --git a/crates/reims-vgpu-window/src/sdl/shell.rs b/crates/reims-vgpu-window/src/sdl/shell.rs
+index 0b27475..c86e67a 100644
+--- a/crates/reims-vgpu-window/src/sdl/shell.rs
++++ b/crates/reims-vgpu-window/src/sdl/shell.rs
+@@ -15,7 +15,10 @@
+ //! zooming, full screen), a windowed window follows the guest's mode: each mode change resizes its
+ //! content as it would open. A resize the library did not ask for, more than a point off the size
+ //! it asked for ([`is_asked`]), is the person's, which ends the following; from then on a mode
+-//! change re-fits the image and the window keeps its size.
++//! change re-fits the image and the window keeps its size. Once that size has settled, the host's
++//! resize callback is told the guest mode, in pixels, that fills the window at the scale the guest
++//! already runs ([`guest_pixels`]). The host replaces the display's modes. Without the callback
++//! the image is only scaled.
+ //!
+ //! **The layout.** Whenever the window's size, its scale or the guest's mode changes, the image is
+ //! laid out again ([`geometry::layout`]) over the window's points at its pixels per point
+@@ -46,6 +49,7 @@
+ 
+ use std::cell::RefCell;
+ use std::sync::Arc;
++use std::time::{Duration, Instant};
+ 
+ use sdl3_sys::everything::*;
+ 
+@@ -92,6 +96,10 @@ pub(crate) struct Shell {
+     shown: Option<bool>,
+     /// Its render thread has let its surface go.
+     released: bool,
++    /// The guest mode a person's resize settled on, not yet told to the host.
++    pending_mode: Option<(u16, u16)>,
++    /// When the pending size last changed. It is told once it has stayed still.
++    pending_at: Option<Instant>,
+ }
+ 
+ /// What an OS made of a window that opened.
+@@ -138,6 +146,36 @@ fn is_asked(size: (i32, i32), asked: (i32, i32)) -> bool {
+     (size.0 - asked.0).abs() <= 1 && (size.1 - asked.1).abs() <= 1
+ }
+ 
++/// How long a person's resize stays still before the guest is told the new mode.
++const RESIZE_SETTLE: Duration = Duration::from_millis(200);
++
++/// The guest mode, in pixels, that fills a window `points` across at `scale` guest pixels per
++/// point. The side is a multiple of 8, at least `min`, and at most 7680. `None` when `points`
++/// is not a size.
++pub(crate) fn guest_pixels(points: f64, scale: u8, min: u16) -> Option<u16> {
++    let px = points * f64::from(scale);
++    if !px.is_finite() || px <= 0.0 {
++        return None;
++    }
++    let rounded = (px / 8.0).round() * 8.0;
++    let value = (rounded as u32).clamp(u32::from(min), 7680);
++    u16::try_from(value).ok()
++}
++
++/// Whether a person's resize is waiting to be told to the guest.
++pub(crate) fn resize_pending() -> bool {
++    OPEN.with(|open| open.borrow().iter().any(|shell| shell.pending_mode.is_some()))
++}
++
++/// Tells the host a resize that has stayed still for [`RESIZE_SETTLE`].
++pub(crate) fn flush_resizes() {
++    OPEN.with(|open| {
++        for shell in open.borrow_mut().iter_mut() {
++            shell.flush_resize();
++        }
++    });
++}
++
+ /// Opens `window`'s SDL window (the module doc), unless the window has ended.
+ pub(crate) fn open(window: &Arc<Window>) {
+     if window.is_closed() || with_shell(window.id(), |_| ()).is_some() {
+@@ -166,6 +204,8 @@ pub(crate) fn open(window: &Arc<Window>) {
+             closed: false,
+             shown: None,
+             released: false,
++            pending_mode: None,
++            pending_at: None,
+         });
+     });
+     with_shell(window.id(), |shell| {
+@@ -316,13 +356,58 @@ pub(crate) fn event(event: &SDL_Event) {
+ }
+ 
+ impl Shell {
++    /// Records the guest mode that would fill the window, told once it stays still.
++    fn arm_resize(&mut self) {
++        let Some(mode) = self.proposed_mode() else {
++            return;
++        };
++        if self.window.mode() == Some(mode) {
++            self.pending_mode = None;
++            self.pending_at = None;
++            return;
++        }
++        self.pending_mode = Some(mode);
++        self.pending_at = Some(Instant::now());
++    }
++
++    /// The guest mode, in pixels, that fills this window at the scale the guest already runs.
++    fn proposed_mode(&self) -> Option<(u16, u16)> {
++        let current = self.window.mode().or_else(|| self.window.offered())?;
++        let scale = self.window.guest_scale(current);
++        let (bounds, _) = os::metrics(self)?;
++        Some((
++            guest_pixels(bounds.0, scale, 640)?,
++            guest_pixels(bounds.1, scale, 480)?,
++        ))
++    }
++
++    /// Tells the host the pending mode once [`RESIZE_SETTLE`] has passed.
++    fn flush_resize(&mut self) {
++        let Some(at) = self.pending_at else {
++            return;
++        };
++        if at.elapsed() < RESIZE_SETTLE {
++            return;
++        }
++        let Some(mode) = self.pending_mode.take() else {
++            self.pending_at = None;
++            return;
++        };
++        self.pending_at = None;
++        if self.window.mode() == Some(mode) {
++            return;
++        }
++        self.window.user_resized(mode.0, mode.1);
++    }
++
+     /// Handles `event`, of type `kind`, for this window.
+     fn event(&mut self, kind: u32, event: &SDL_Event) {
+         let capture_changed = match kind {
+             k if k == SDL_EVENT_WINDOW_RESIZED.0 => {
+                 // SAFETY: a window event.
+                 let size = unsafe { (event.window.data1, event.window.data2) };
+-                if self.follows_guest && !is_asked(size, self.asked) {
++                let person = !is_asked(size, self.asked);
++                if self.follows_guest && person {
+                     self.follows_guest = false;
+                     log::debug!(
+                         target: "reims_vgpu_window",
+@@ -331,6 +416,9 @@ impl Shell {
+                     );
+                 }
+                 self.relayout();
++                if !self.follows_guest && person {
++                    self.arm_resize();
++                }
+                 false
+             }
+             k if k == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED.0
+@@ -802,4 +890,16 @@ mod tests {
+         assert!(!is_asked((1918, 1200), (1920, 1200)));
+         assert!(!is_asked((1920, 1100), (1920, 1200)));
+     }
++
++    /// A person's window, in points, becomes a guest mode at the scale the guest already runs.
++    /// Sides land on multiples of 8, and a tiny window stays at the minimum.
++    #[test]
++    fn a_settled_resize_fills_the_window_at_the_guest_scale() {
++        assert_eq!(guest_pixels(1920.0, 2, 640), Some(3840));
++        assert_eq!(guest_pixels(1600.0, 2, 640), Some(3200));
++        assert_eq!(guest_pixels(900.0, 2, 480), Some(1800));
++        assert_eq!(guest_pixels(1920.4, 2, 640), Some(3840));
++        assert_eq!(guest_pixels(100.0, 2, 640), Some(640));
++        assert_eq!(guest_pixels(f64::NAN, 2, 640), None);
++    }
+ }
+diff --git a/crates/reims-vgpu/src/lib.rs b/crates/reims-vgpu/src/lib.rs
+index a88d015..6229720 100644
+--- a/crates/reims-vgpu/src/lib.rs
++++ b/crates/reims-vgpu/src/lib.rs
+@@ -85,8 +85,8 @@ pub type DefaultPlatform = MetalPlatform;
+ pub type DefaultPlatform = VulkanPlatform;
+ pub use reims_vgpu_window::{
+     BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE, CloseFn, KeyFn,
+-    MomentumPhase, PointerFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn, WindowCallbacks,
+-    WindowConfig,
++    MomentumPhase, PointerFn, ResizeFn, ScrollEvent, ScrollFn, ScrollPhase, WheelFn,
++    WindowCallbacks, WindowConfig,
+ };
+ 
+ /// The most display ports a device has.

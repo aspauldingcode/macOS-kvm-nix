@@ -24,10 +24,21 @@
       };
       reims = pkgs.callPackage ./pkgs/reims-ctl.nix { };
       macserial = pkgs.callPackage ./pkgs/macserial.nix { };
+      # crate2nix. libdbus is what the tray's StatusNotifier item links.
+      macos-kvm = (
+        pkgs.callPackage ./crates/macos-kvm/Cargo.nix {
+          defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+            libdbus-sys = attrs: {
+              nativeBuildInputs = (attrs.nativeBuildInputs or [ ]) ++ [ pkgs.pkg-config ];
+              buildInputs = (attrs.buildInputs or [ ]) ++ [ pkgs.dbus ];
+            };
+          };
+        }
+      ).rootCrate.build;
     in
     {
       packages.${system} = {
-        inherit reims macserial;
+        inherit reims macserial macos-kvm;
         default = reims;
       };
 

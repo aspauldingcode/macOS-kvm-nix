@@ -64,26 +64,7 @@ EOF
     hardeningDisable = (old.hardeningDisable or [ ]) ++ [ "fortify" ];
   });
 
-  # Host tools for the headless install. The guest runs the shell script;
-  # these build the disk it is on and talk to QMP.
-  installer = pkgs.writeShellScriptBin "macos-kvm-install" ''
-    export PATH="${
-      lib.makeBinPath [
-        pkgs.python3
-        pkgs.mtools
-        pkgs.util-linux
-        bomutils
-        pkgs.xar
-        pkgs.cpio
-        pkgs.gzip
-        pkgs.procps
-        pkgs.coreutils
-        pkgs.openssh
-        macserial
-      ]
-    }:$PATH"
-    exec ${pkgs.python3}/bin/python3 ${../scripts/headless-install.py} "$@"
-  '';
+  tool = self.packages.${pkgs.stdenv.hostPlatform.system}.macos-kvm;
 
   primeEnv = lib.optionals cfg.primeOffload [
     "__NV_PRIME_RENDER_OFFLOAD=1"
@@ -97,11 +78,20 @@ EOF
   session = pkgs.writeShellApplication {
     name = "macos-kvm";
     runtimeInputs = [
+      tool
       reims
-      installer
+      macserial
+      bomutils
+      pkgs.mtools
+      pkgs.util-linux
+      pkgs.xar
+      pkgs.cpio
+      pkgs.gzip
+      pkgs.procps
       pkgs.coreutils
-      pkgs.gnugrep
       pkgs.openssh
+      pkgs.libnotify
+      pkgs.systemd
     ];
     text = ''
       set -euo pipefail
@@ -110,7 +100,6 @@ EOF
       export REIMS_CTL_QEMU=${qemuShare}/bin/qemu-system-x86_64
       export REIMS_CTL_UTIL=${reims}/bin/reims-util
       export MACOS_KVM_SHARE="$HOME/SHARED_FOLDER"
-      reims_ctl=${reims}/bin/.reims-ctl-wrapped
       # NixOS publishes Vulkan ICDs here. A user service does not always
       # inherit the desktop's XDG_DATA_DIRS, and reims-ctl only searches those.
       case ":''${XDG_DATA_DIRS:-}:" in
@@ -128,150 +117,27 @@ EOF
 
       ${lib.concatMapStrings (line: "export ${line}\n") primeEnv}
 
-      name=${lib.escapeShellArg cfg.name}
-      account=${lib.escapeShellArg account}
-      host_user=${lib.escapeShellArg cfg.user}
-      ssh_port=${toString (if cfg.sshPort == null then 2222 else cfg.sshPort)}
-      password_file=${lib.escapeShellArg (if cfg.accountPasswordFile == null then "" else cfg.accountPasswordFile)}
-
-      publish_access() {
-        local dir="$HOME/.local/share/reims-ctl/vms/$name"
-        local sshdir="$dir/ssh"
-        mkdir -p "$sshdir" "$HOME/SHARED_FOLDER" "$HOME/.ssh"
-        chmod 700 "$sshdir" "$HOME/.ssh"
-        chmod 755 "$HOME/SHARED_FOLDER"
-        if [[ ! -f "$sshdir/id_ed25519" ]]; then
-          ssh-keygen -t ed25519 -N "" -C "macos-kvm-$name" -f "$sshdir/id_ed25519"
-        fi
-        if [[ ! -f "$sshdir/guest_id_ed25519" ]]; then
-          ssh-keygen -t ed25519 -N "" -C "macos-kvm-$name-guest" -f "$sshdir/guest_id_ed25519"
-        fi
-        chmod 600 "$sshdir/id_ed25519" "$sshdir/guest_id_ed25519"
-        # %C is 40 hex characters. The VM directory makes that path longer
-        # than a Unix socket name, so the multiplex socket lives in the runtime dir.
-        local runtime="''${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-        mkdir -p "$runtime"
-        printf '%s\n' \
-          "Host $name macos macos-kvm" \
-          "  HostName 127.0.0.1" \
-          "  Port $ssh_port" \
-          "  User $account" \
-          "  IdentityFile $sshdir/id_ed25519" \
-          "  IdentitiesOnly yes" \
-          "  ControlMaster auto" \
-          "  ControlPath $runtime/macos-kvm-%C" \
-          "  ControlPersist 10m" \
-          "  Compression no" \
-          "  Ciphers aes128-gcm@openssh.com" \
-          "  IPQoS none" \
-          "  StrictHostKeyChecking accept-new" \
-          "  UserKnownHostsFile $sshdir/known_hosts" \
-          > "$sshdir/config"
-        chmod 600 "$sshdir/config"
-        # ~/.ssh/config is often a Home Manager symlink into the store.
-        # The include is added there when Home Manager is present. This file
-        # is what `macos-kvm ssh` uses either way.
-        local keys="$HOME/.ssh/authorized_keys"
-        if [[ -L "$keys" ]]; then
-          :
-        else
-          touch "$keys"
-          chmod 600 "$keys"
-          local pub
-          pub="$(cat "$sshdir/guest_id_ed25519.pub")"
-          if ! grep -qxF "$pub" "$keys"; then
-            printf '%s\n' "$pub" >> "$keys"
-          fi
-        fi
-      }
-
-      cmd="''${1:-open}"
-      case "$cmd" in
-        open|ensure) ;;
-        account)
-          cat "$HOME/.local/share/reims-ctl/vms/$name/account.password"
-          exit 0
-          ;;
-        ssh)
-          publish_access
-          shift
-          exec ssh -F "$HOME/.local/share/reims-ctl/vms/$name/ssh/config" "$name" "$@"
-          ;;
-        *) exec "$reims_ctl" "$@" ;;
-      esac
-
-      if ! "$reims_ctl" show "$name" >/dev/null 2>&1; then
-        vm_dir="$HOME/.local/share/reims-ctl/vms/$name"
-        # SSH keys live in the VM directory. Creating that directory first makes
-        # reims-ctl refuse to create the VM.
-        if [[ -d "$vm_dir" && ! -f "$vm_dir/vm.toml" ]]; then
-          rm -rf "$vm_dir"
-        fi
-        # Wiping the directory leaves the name in reims-ctl's registry.
-        "$reims_ctl" delete "$name" --yes >/dev/null 2>&1 || true
-        args=(
-          create "$name"
-          --macos ${lib.escapeShellArg cfg.macos}
-          --disk-size ${lib.escapeShellArg cfg.diskSize}
-          --resolution ${lib.escapeShellArg cfg.resolution}
-          --hidpi ${if cfg.hidpi then "true" else "false"}
-          --borderless ${if cfg.borderless then "true" else "false"}
-          --audio ${if cfg.audio then "true" else "false"}
-          --logs
-        )
-        ${lib.optionalString (cfg.cpus != null) ''
-          args+=(--cpus ${toString cfg.cpus})
-        ''}
-        ${lib.optionalString (cfg.memory != null) ''
-          args+=(--memory ${lib.escapeShellArg cfg.memory})
-        ''}
-        ${lib.optionalString (cfg.sshPort != null) ''
-          args+=(--ssh-port ${toString cfg.sshPort})
-        ''}
-        ${lib.optionalString cfg.offline ''
-          args+=(--offline)
-        ''}
-        ${
-          if cfg.primeOffload then
-            ''
-              args+=(--gpu ${lib.escapeShellArg nvidiaIcd})
-            ''
-          else
-            ''
-              args+=(--gpu auto)
-            ''
-        }
-        "$reims_ctl" "''${args[@]}"
-      fi
-      publish_access
-
-      install_args=(
-        run
-        --name "$name"
-        --account "$account"
-        --host-user "$host_user"
-        --macos ${lib.escapeShellArg cfg.macos}
-        --ssh-port "$ssh_port"
-        --reims "$reims_ctl"
-        --util ${reims}/bin/reims-util
-        --macserial ${macserial}/bin/macserial
-      )
-      if [[ -n "$password_file" ]]; then
-        install_args+=(--password-file "$password_file")
-      fi
-      macos-kvm-install "''${install_args[@]}"
-
-      state_line="$("$reims_ctl" show "$name" | grep -m1 -E '^[[:space:]]*state[[:space:]]' || true)"
-      # "state    running (pid N)" or "state    stopped"
-      case "$state_line" in
-        *" running "*|*" running") ;;
-        *) "$reims_ctl" start "$name" ;;
-      esac
-      # Type=simple runs ExecStop when this process exits, and ExecStop
-      # powers the guest off. Stay alive for as long as the guest does.
-      while "$reims_ctl" show "$name" 2>/dev/null | grep -q 'running'; do
-        sleep 5
-      done
+      export MACOS_KVM_REIMS=${reims}/bin/.reims-ctl-wrapped
+      export MACOS_KVM_UTIL=${reims}/bin/reims-util
+      export MACOS_KVM_MACSERIAL=${macserial}/bin/macserial
+      export MACOS_KVM_NAME=${lib.escapeShellArg cfg.name}
+      export MACOS_KVM_ACCOUNT=${lib.escapeShellArg account}
+      export MACOS_KVM_HOST_USER=${lib.escapeShellArg cfg.user}
+      export MACOS_KVM_MACOS=${lib.escapeShellArg cfg.macos}
+      export MACOS_KVM_DISK=${lib.escapeShellArg cfg.diskSize}
+      export MACOS_KVM_RESOLUTION=${lib.escapeShellArg cfg.resolution}
+      export MACOS_KVM_HIDPI=${if cfg.hidpi then "true" else "false"}
+      export MACOS_KVM_BORDERLESS=${if cfg.borderless then "true" else "false"}
+      export MACOS_KVM_AUDIO=${if cfg.audio then "true" else "false"}
+      export MACOS_KVM_SSH_PORT=${toString (if cfg.sshPort == null then 2222 else cfg.sshPort)}
+      export MACOS_KVM_OFFLINE=${if cfg.offline then "true" else "false"}
+      export MACOS_KVM_GPU=${if cfg.primeOffload then lib.escapeShellArg nvidiaIcd else "auto"}
+      export MACOS_KVM_CPUS=${lib.escapeShellArg (if cfg.cpus == null then "" else toString cfg.cpus)}
+      export MACOS_KVM_MEMORY=${lib.escapeShellArg (if cfg.memory == null then "" else cfg.memory)}
+      export MACOS_KVM_PASSWORD_FILE=${lib.escapeShellArg (if cfg.accountPasswordFile == null then "" else cfg.accountPasswordFile)}
+      export MACOS_KVM_PASSWORD=${lib.escapeShellArg (if cfg.accountPassword == null then "" else cfg.accountPassword)}
+      export MACOS_KVM_LOGIN_WINDOW=${if cfg.loginWindow then "true" else "false"}
+      exec ${tool}/bin/macos-kvm "$@"
     '';
   };
 in
@@ -307,8 +173,22 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = ''
-        Account created on the guest. Null uses macos-kvm.user. The password
-        is generated into the VM directory unless accountPasswordFile is set.
+        Short name of the account created on the guest. Null uses
+        macos-kvm.user. This name is fixed at install; a later change does
+        not rename the account. A later change of accountPassword does
+        change the password of the account that was installed.
+      '';
+    };
+
+    accountPassword = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Password of the guest account. When this changes after the guest is
+        installed, the next start applies it over SSH. The value is part of
+        the NixOS system and is readable by every user on the machine. Use
+        accountPasswordFile instead when the password must stay out of the
+        store. Null generates a password into the VM directory.
       '';
     };
 
@@ -318,8 +198,19 @@ in
       description = ''
         Runtime path of a file containing the guest account password. A nix
         path would be copied into the world-readable store, so this is a
-        string read when the install runs. Null generates a password at
+        string read when the install runs. Used when accountPassword is
+        null. Null generates a password at
         ~/.local/share/reims-ctl/vms/<name>/account.password (mode 0600).
+      '';
+    };
+
+    loginWindow = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Show the login window. The default, false, signs the account in
+        when the guest boots and opens the desktop. A later change is
+        applied to an installed guest on the next start.
       '';
     };
 
@@ -356,8 +247,10 @@ in
       type = lib.types.str;
       default = "3840x2160";
       description = ''
-        Guest framebuffer. With hidpi, reims-ctl halves each edge, so
-        3840x2160 looks like 1920x1080.
+        The mode the guest starts in. With hidpi, reims-ctl halves each
+        edge, so 3840x2160 looks like 1920x1080. After the window settles
+        on a new size, the Reims display offers that size and the guest
+        switches to it.
       '';
     };
 
@@ -371,8 +264,8 @@ in
       type = lib.types.bool;
       default = false;
       description = ''
-        Borderless windows fill a screen. Leave this off for a normal
-        resizable window.
+        Borderless windows fill a screen and do not follow a drag.
+        Leave this off so the guest display tracks the window.
       '';
     };
 
@@ -484,6 +377,18 @@ in
         TimeoutStartSec = "infinity";
         ExecStart = "${session}/bin/macos-kvm ensure";
         ExecStop = "${session}/bin/macos-kvm stop ${cfg.name} --timeout ${toString cfg.stopTimeout}";
+      };
+    };
+
+    systemd.user.services.macos-kvm-tray = {
+      description = "macOS guest menu";
+      wantedBy = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      serviceConfig = {
+        ExecStart = "${session}/bin/macos-kvm tray";
+        Restart = "on-failure";
+        RestartSec = 3;
       };
     };
     })
