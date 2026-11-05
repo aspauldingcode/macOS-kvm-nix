@@ -45,7 +45,7 @@ The install is silent. The window stays hidden and the speaker stays off until t
 
 `accountName` is the guest's short name (`macos-kvm.user` when it is left null). `accountPassword` sets the password. Changing it later, then starting the guest, changes the password of the account that was installed; it does not reinstall macOS. `loginWindow = true` shows the login window instead. Changing that later is applied the same way. `accountPassword` is stored in the NixOS system, which every user on the machine can read. `accountPasswordFile` is a runtime path for a password that must stay out of the store. Leaving both unset generates one at `~/.local/share/reims-ctl/vms/tahoe/account.password` (mode 0600).
 
-A StatusNotifier item (a menubar applet, in Waybar's tray) can open, start, stop, restart, show, or quit the guest. virtio-net carries the shared folder and SSH. The display stays the Reims GPU: a window resize offers the new size through `rvg_display_set_modes`, and the guest switches to it. virtio-gpu is not the display.
+A StatusNotifier item (a menubar applet, in Waybar's tray) can open, start, stop, restart, show, or quit the guest. Retina turns the guest's display scale on or off; a running guest restarts so the new density is used. virtio-net carries the shared folder and SSH. The display stays the Reims GPU: a window resize offers the new size through `rvg_display_set_modes`, and the guest switches to it. virtio-gpu is not the display.
 
 OpenCore's serial, board serial, UUID, and ROM come from `macserial`, the same program [osx-serial-generator](https://github.com/sickcodes/osx-serial-generator) runs, for an iMac20,1. They are written into reims-util's OpenCore image, which keeps `ReimsVgpu.kext`. The generator's own boot disk is not used.
 
