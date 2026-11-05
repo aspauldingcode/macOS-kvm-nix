@@ -5,6 +5,13 @@
 LOG=/Volumes/MACOSKVM/status
 echo FINISH >>"$LOG"
 sync
+# Recovery leaves the installed Data volume unmounted.
+diskutil mount "Macintosh HD - Data" >>"$LOG" 2>&1 || true
+diskutil list | sed -n 's/.*\(disk[0-9][0-9]*s[0-9][0-9]*\).*/\1/p' | while read -r dev; do
+  diskutil mount "$dev" >>"$LOG" 2>&1 || true
+done
+ls /Volumes >>"$LOG" 2>&1
+sync
 data=""
 for v in /Volumes/*; do
   base=$(basename "$v")
@@ -13,9 +20,8 @@ for v in /Volumes/*; do
   esac
   case "$base" in
     *" - Data")
-      if [ -d "$v/Users" ]; then
-        data=$v
-      fi
+      # Users is created at first boot. The volume is the target before that.
+      data=$v
       ;;
   esac
 done
