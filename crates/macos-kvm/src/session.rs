@@ -278,16 +278,21 @@ fn sync_account(cfg: &Config) -> Result<()> {
     let script = crate::sync::guest_script(&account);
     let kc = crate::sync::encode_base64(&crate::kcpassword(&update.new));
     let config = dir.join("ssh/config");
+    // One remote command. Separate arguments are joined by the guest's zsh,
+    // and that shell then never passes stdin on to bash.
+    let remote = format!("bash -c {}", zsh_quote(&script));
     let mut child = Command::new("ssh")
         .args([
             "-F",
             &config.to_string_lossy(),
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
             &cfg.name,
-            "bash",
-            "-c",
-            &script,
+            &remote,
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -403,6 +408,10 @@ fn require(key: &str) -> Result<PathBuf> {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| format!("{key} is not set").into())
+}
+
+fn zsh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn bool_word(value: bool) -> String {
