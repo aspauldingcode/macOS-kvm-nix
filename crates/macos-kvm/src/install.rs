@@ -147,7 +147,20 @@ impl Install {
             self.plant(&image)?;
         }
         self.boot_installed_disk()?;
-        self.wait_for_ssh(&image)?;
+        // The installer can reboot, look finished, and then rebuild the Data
+        // volume, which throws away a plant done too early. The next boot is
+        // Setup Assistant with no SSH. Plant once more and that one stays.
+        if self
+            .wait_for_ssh(&image, Duration::from_secs(30 * 60))
+            .is_err()
+            && !crate::ssh_banner_up(self.ssh_port)
+        {
+            self.log("SSH did not come up; planting the account again");
+            let _ = fs::remove_file(dir.join("account-planted"));
+            self.plant(&image)?;
+            self.boot_installed_disk()?;
+        }
+        self.wait_for_ssh(&image, Duration::from_secs(8 * HOURS))?;
         self.finish_installed()
     }
 
@@ -356,9 +369,9 @@ impl Install {
         Ok(())
     }
 
-    fn wait_for_ssh(&self, image: &Path) -> Result<()> {
+    fn wait_for_ssh(&self, image: &Path, limit: Duration) -> Result<()> {
         self.note("Setting up macOS", "Waiting for the first boot");
-        let deadline = Instant::now() + Duration::from_secs(8 * HOURS);
+        let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
             if image.is_file() && self.status(image).contains("BOOTSTRAP") {
                 self.log("first-boot bootstrap ran");
